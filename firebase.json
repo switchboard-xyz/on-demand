@@ -1,0 +1,9 @@
+{
+  "hosting": [
+    {
+      "site": "switchboard-docs",
+      "public": "docs",
+      "rewrites": [{ "source": "**", "destination": "/index.html" }]
+    }
+  ]
+}
