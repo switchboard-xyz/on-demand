@@ -1,3 +1,4 @@
+process.removeAllListeners("warning");
 export * from "./accounts/index.js";
 export * from "./anchor-utils/index.js";
 export * from "./constants.js";

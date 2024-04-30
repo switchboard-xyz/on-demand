@@ -1,6 +1,24 @@
+import { SB_ON_DEMAND_PID } from "./../constants.js";
+
 import * as anchor from "@coral-xyz/anchor";
-import { Keypair } from "@solana/web3.js";
+import type { Commitment } from "@solana/web3.js";
+import { Connection, Keypair } from "@solana/web3.js";
 import * as fs from "fs";
+import yaml from "js-yaml";
+import os from "os";
+import path from "path";
+
+type SolanaConfig = {
+  rpcUrl: string;
+  webSocketUrl: string;
+  keypairPath: string;
+  commitment: Commitment;
+  keypair: Keypair;
+  connection: Connection;
+  provider: anchor.AnchorProvider;
+  wallet: anchor.Wallet;
+  program: anchor.Program | null;
+};
 
 /*
  * AnchorUtils is a utility class that provides helper functions for working with
@@ -21,10 +39,77 @@ export class AnchorUtils {
   static async initWalletFromFile(
     filePath: string
   ): Promise<[anchor.Wallet, Keypair]> {
+    const keypair = await AnchorUtils.initKeypairFromFile(filePath);
+    const wallet: anchor.Wallet = new anchor.Wallet(keypair);
+    return [wallet, keypair];
+  }
+
+  static async initKeypairFromFile(filePath: string): Promise<Keypair> {
     const secretKeyString = fs.readFileSync(filePath, { encoding: "utf8" });
     const secretKey: Uint8Array = Uint8Array.from(JSON.parse(secretKeyString));
     const keypair: Keypair = Keypair.fromSecretKey(secretKey);
-    const wallet: anchor.Wallet = new anchor.Wallet(keypair);
-    return [wallet, keypair];
+    return keypair;
+  }
+
+  static async loadProgramFromEnv(): Promise<anchor.Program> {
+    const config = await AnchorUtils.loadEnv();
+    const idl = (await anchor.Program.fetchIdl(
+      SB_ON_DEMAND_PID,
+      config.provider
+    ))!;
+    const program = new anchor.Program(idl, SB_ON_DEMAND_PID, config.provider);
+    return new anchor.Program(idl, SB_ON_DEMAND_PID, config.provider);
+  }
+
+  static async loadEnv(): Promise<SolanaConfig> {
+    const configPath = path.join(
+      os.homedir(),
+      ".config",
+      "solana",
+      "cli",
+      "config.yml"
+    );
+    const fileContents = fs.readFileSync(configPath, "utf8");
+    const data = yaml.load(fileContents);
+    const defaultCon = new Connection("https://api.devnet.solana.com");
+    const defaultKeypair = Keypair.generate();
+    const config: SolanaConfig = {
+      rpcUrl: data.json_rpc_url,
+      webSocketUrl: data.websocket_url,
+      keypairPath: data.keypair_path,
+      commitment: data.commitment as Commitment,
+      keypair: data.keypair_path,
+      connection: defaultCon,
+      provider: new anchor.AnchorProvider(
+        defaultCon,
+        new anchor.Wallet(defaultKeypair),
+        {}
+      ),
+      wallet: new anchor.Wallet(defaultKeypair),
+      program: null,
+    };
+    config.keypair = (
+      await AnchorUtils.initWalletFromFile(config.keypairPath)
+    )[1];
+    config.connection = new Connection(config.rpcUrl, {
+      commitment: "confirmed",
+    });
+    config.wallet = new anchor.Wallet(config.keypair);
+    config.provider = new anchor.AnchorProvider(
+      config.connection,
+      config.wallet,
+      {
+        preflightCommitment: "confirmed",
+        commitment: "confirmed",
+      }
+    );
+    const idl = (await anchor.Program.fetchIdl(
+      SB_ON_DEMAND_PID,
+      config.provider
+    ))!;
+    const program = new anchor.Program(idl, SB_ON_DEMAND_PID, config.provider);
+    config.program = program;
+
+    return config;
   }
 }

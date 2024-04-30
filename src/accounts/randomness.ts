@@ -1,20 +1,30 @@
 import { SLOT_HASHES_SYSVAR_ID } from "../constants.js";
 import type { RandomnessRevealResponse } from "../oracle-interfaces/gateway.js";
 import { Gateway } from "../oracle-interfaces/gateway.js";
-import { State } from "./state.js";
-import { Oracle } from "./oracle.js";
+
 import { InstructionUtils } from "./../instruction-utils/InstructionUtils.js";
 import { RecentSlotHashes } from "./../sysvars/recentSlothashes.js";
+import { Oracle } from "./oracle.js";
+import { Queue } from "./queue.js";
+import { State } from "./state.js";
+
 import { BN, BorshAccountsCoder, type Program, utils } from "@coral-xyz/anchor";
-import type { Keypair, TransactionInstruction } from "@solana/web3.js";
+import * as anchor from "@coral-xyz/anchor";
+import * as spl from "@solana/spl-token";
+import type { TransactionInstruction } from "@solana/web3.js";
 import {
+  AddressLookupTableAccount,
+  AddressLookupTableProgram,
   ComputeBudgetProgram,
+  Keypair,
+  MessageV0,
   PublicKey,
   SystemProgram,
+  Transaction,
 } from "@solana/web3.js";
 import { sendTxWithJito } from "@solworks/soltoolkit-sdk/build/modules/TransactionWrapper.js";
 import * as bs58 from "bs58";
-import * as spl from "@solana/spl-token";
+import * as fs from "fs";
 
 /**
  * Switchboard commit-reveal randomness.
@@ -63,8 +73,23 @@ export class Randomness {
     kp: Keypair,
     queue: PublicKey
   ): Promise<[Randomness, TransactionInstruction]> {
+    const payer = (program.provider as any).wallet.payer;
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), kp.publicKey.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const recentSlot = await program.provider.connection.getSlot("finalized");
+    const [_, lut] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot,
+    });
     const ix = await program.instruction.randomnessInit(
-      {},
+      {
+        recentSlot: new anchor.BN(recentSlot.toString()),
+      },
       {
         accounts: {
           randomness: kp.publicKey,
@@ -80,6 +105,9 @@ export class Randomness {
           associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
           wrappedSolMint: spl.NATIVE_MINT,
           programState: State.keyFromSeed(program),
+          lutSigner,
+          lut,
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
         },
       }
     );
@@ -90,16 +118,19 @@ export class Randomness {
    * Generate a randomness `commit` solana transaction instruction.
    * This will commit the randomness account to use currentSlot + 1 slothash
    * as the non-repeating randomness seed.
+   * @param oracle The oracle public key for the commit instruction.
    * @returns A promise that resolves to the transaction instruction.
    */
-  async commitIx(): Promise<TransactionInstruction> {
-    const data = await this.loadData();
+  async commitIx(queue: PublicKey): Promise<TransactionInstruction> {
+    const queueAccount = new Queue(this.program, queue);
+    const oracle = await queueAccount.fetchFreshOracle();
     const ix = await this.program.instruction.randomnessCommit(
       {},
       {
         accounts: {
           randomness: this.pubkey,
-          queue: data.queue,
+          queue: queue,
+          oracle: oracle,
           recentSlothashes: SLOT_HASHES_SYSVAR_ID,
         },
       }
@@ -172,11 +203,14 @@ export class Randomness {
   async commitAndReveal(
     callback: TransactionInstruction[],
     signers: Keypair[],
+    queue: PublicKey,
     configs?: {
       computeUnitPrice?: number;
       computeUnitLimit?: number;
     }
   ): Promise<void> {
+    const queueAccount = new Queue(this.program, queue);
+    const oracle = await queueAccount.fetchFreshOracle();
     const computeUnitPrice = configs?.computeUnitPrice ?? 1;
     const computeUnitLimit = configs?.computeUnitLimit ?? 200_000;
     const connection = this.program.provider.connection;
@@ -191,7 +225,7 @@ export class Randomness {
         ComputeBudgetProgram.setComputeUnitPrice({
           microLamports: computeUnitPrice,
         }),
-        await this.commitIx(),
+        await this.commitIx(oracle),
       ]);
       tx.sign([payer]);
       const sim = await connection.simulateTransaction(tx, {
@@ -281,5 +315,82 @@ export class Randomness {
       await connection.confirmTransaction(sig);
       console.log(`RevealAndCallback transaction confirmed: ${sig}`);
     }
+  }
+
+  /**
+   *  Serialize ix to file.
+   *  @param ix The reveal instruction of a transaction.
+   *  @param fileName The name of the file to save the serialised IX to.
+   *  @throws if the request fails.
+   */
+  async serializeIxToFile(
+    revealIxs: TransactionInstruction[],
+    fileName: string = "serializedIx.bin"
+  ): Promise<void> {
+    const tx = await InstructionUtils.asV0Tx(this.program, revealIxs);
+
+    fs.writeFile(fileName, tx.serialize(), (err) => {
+      if (err) {
+        console.error("Failed to write to file:", err);
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * Creates a new `Randomness` account and prepares a commit transaction instruction.
+   * @param program The Anchor program instance.
+   * @param kp The keypair of the new `Randomness` account.
+   * @param queue The queue account to associate with the new `Randomness` account.
+   * @param oracle The oracle public key for the commit instruction.
+   * @returns A promise that resolves to a tuple containing the new `Randomness` instance, an array of transaction instructions.
+   */
+  static async createAndCommitIxs(
+    program: Program,
+    queue: PublicKey
+  ): Promise<[Randomness, Keypair, TransactionInstruction[]]> {
+    const kp = Keypair.generate();
+    const payer = (program.provider as any).wallet.payer;
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), kp.publicKey.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const recentSlot = await program.provider.connection.getSlot("finalized");
+    const [_, lut] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot,
+    });
+    const queueAccount = new Queue(program, queue);
+    const oracle = await queueAccount.fetchFreshOracle();
+    const creationIx = await program.instruction.randomnessInit(
+      {},
+      {
+        accounts: {
+          randomness: kp.publicKey,
+          queue,
+          authority: program.provider.publicKey!,
+          payer: program.provider.publicKey!,
+          rewardEscrow: spl.getAssociatedTokenAddressSync(
+            spl.NATIVE_MINT,
+            kp.publicKey
+          ),
+          systemProgram: SystemProgram.programId,
+          tokenProgram: spl.TOKEN_PROGRAM_ID,
+          associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+          wrappedSolMint: spl.NATIVE_MINT,
+          programState: State.keyFromSeed(program),
+          lutSigner,
+          lut,
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
+        },
+      }
+    );
+    const newRandomness = new Randomness(program, kp.publicKey);
+    const commitIx = await newRandomness.commitIx(oracle);
+
+    return [newRandomness, kp, [creationIx, commitIx]];
   }
 }

@@ -2,8 +2,14 @@ import { State } from "./state.js";
 
 import type { Program } from "@coral-xyz/anchor";
 import { BN, BorshAccountsCoder, utils } from "@coral-xyz/anchor";
-import { PublicKey } from "@solana/web3.js";
-import { Keypair, SystemProgram } from "@solana/web3.js";
+import * as spl from "@solana/spl-token";
+import type { AddressLookupTableAccount } from "@solana/web3.js";
+import {
+  AddressLookupTableProgram,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+} from "@solana/web3.js";
 
 /**
  *  This class represents an oracle account on chain.
@@ -33,8 +39,20 @@ export class Oracle {
         program.programId
       )
     )[0];
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), oracle.publicKey.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const recentSlot = await program.provider.connection.getSlot("finalized");
+    const [_, lut] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot,
+    });
     const sig = await program.rpc.oracleInit(
-      {},
+      { recentSlot: new BN(recentSlot.toString()) },
       {
         accounts: {
           oracle: oracle.publicKey,
@@ -49,6 +67,9 @@ export class Oracle {
           stakeProgram: PublicKey.default,
           stakePool: PublicKey.default,
           delegationPool: PublicKey.default,
+          lutSigner,
+          lut,
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
         },
         signers: [payer, oracle],
       }
@@ -98,5 +119,30 @@ export class Oracle {
     const status = data.enclave.verificationStatus;
     const expiration = data.enclave.validUntil;
     return [status === 4 && now < expiration, expiration.toNumber()];
+  }
+
+  async lutKey(): Promise<PublicKey> {
+    const payer = (this.program.provider as any).wallet.payer;
+    const data = await this.loadData();
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), this.pubkey.toBuffer()],
+        this.program.programId
+      )
+    )[0];
+    const [_, lutKey] = await AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot: data.lutSlot,
+    });
+    return lutKey;
+  }
+
+  async loadLookupTable(): Promise<AddressLookupTableAccount> {
+    const lutKey = await this.lutKey();
+    const accnt = await this.program.provider.connection.getAddressLookupTable(
+      lutKey
+    );
+    return accnt.value!;
   }
 }

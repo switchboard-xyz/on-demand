@@ -2,7 +2,6 @@ import type * as anchor from "@coral-xyz/anchor";
 import type { PublicKey } from "@solana/web3.js";
 import { OracleJob } from "@switchboard-xyz/common";
 import * as bs58 from "bs58";
-import { RecentSlotHashes } from "./../sysvars/recentSlothashes.js";
 
 /**
  *  The response from the gateway after fetching signatures.
@@ -160,13 +159,14 @@ export class Gateway {
     const { recentHash, jobs, numSignatures, maxVariance, minResponses } =
       params;
     const encodedJobs = encodeJobs(jobs);
-    return this.fetchSignaturesFromEncoded({
+    const res = await this.fetchSignaturesFromEncoded({
       recentHash,
       encodedJobs,
       numSignatures,
       maxVariance,
       minResponses,
     });
+    return res;
   }
 
   async fetchRandomnessReveal(params: {
@@ -177,7 +177,6 @@ export class Gateway {
     const url = `${this.gatewayUrl}/gateway/api/v1/randomness_reveal`;
     const method = "POST";
     const headers = { "Content-Type": "application/json" };
-    const randomness_key = params.randomnessAccount.toBuffer().toString("hex");
     const body = JSON.stringify({
       slothash: [...bs58.decode(params.slothash)],
       randomness_key: params.randomnessAccount.toBuffer().toString("hex"),

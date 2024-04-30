@@ -5,11 +5,20 @@ import type { SwitchboardPermission } from "./permission.js";
 import { Permission } from "./permission.js";
 import { State } from "./state.js";
 
-import { BorshAccountsCoder, type Program, utils } from "@coral-xyz/anchor";
 import * as anchor from "@coral-xyz/anchor";
-import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
-import { Keypair, SystemProgram } from "@solana/web3.js";
-import type { OracleJob } from "@switchboard-xyz/common";
+import { BorshAccountsCoder, type Program, utils } from "@coral-xyz/anchor";
+import * as spl from "@solana/spl-token";
+import type {
+  AddressLookupTableAccount,
+  TransactionInstruction,
+} from "@solana/web3.js";
+import {
+  AddressLookupTableProgram,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+} from "@solana/web3.js";
+import { FeedHash, type OracleJob } from "@switchboard-xyz/common";
 
 /**
  *  Removes trailing null bytes from a string.
@@ -30,7 +39,7 @@ function removeTrailingNullBytes(input: string): string {
  *  This account is used to store the queue data for a given feed.
  */
 export class Queue {
-  static async create(
+  static async createIx(
     program: Program,
     params: {
       allowAuthorityOverrideAfter?: number;
@@ -40,7 +49,7 @@ export class Queue {
       reward?: number;
       nodeTimeout?: number;
     }
-  ): Promise<[Queue, string]> {
+  ): Promise<[Queue, Keypair, TransactionInstruction]> {
     const queue = Keypair.generate();
     const allowAuthorityOverrideAfter =
       params.allowAuthorityOverrideAfter ?? 60 * 60;
@@ -53,8 +62,20 @@ export class Queue {
     const nodeTimeout = params.nodeTimeout ?? 300;
     const payer = (program.provider as any).wallet.payer;
     // Prepare accounts for the transaction
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), queue.publicKey.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const recentSlot = await program.provider.connection.getSlot("finalized");
+    const [_, lut] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot,
+    });
 
-    const sig = await program.rpc.queueInit(
+    const ix = await program.instruction.queueInit(
       {
         allowAuthorityOverrideAfter,
         requireAuthorityHeartbeatPermission,
@@ -62,6 +83,7 @@ export class Queue {
         maxQuoteVerificationAge,
         reward,
         nodeTimeout,
+        recentSlot,
       },
       {
         accounts: {
@@ -76,7 +98,7 @@ export class Queue {
         signers: [payer, queue],
       }
     );
-    return [new Queue(program, queue.publicKey), sig];
+    return [new Queue(program, queue.publicKey), queue, ix];
   }
 
   /**
@@ -106,6 +128,10 @@ export class Queue {
     return queueAccount.fetchSignatures(params);
   }
 
+  /**
+   * @deprecated
+   * Deprecated. Use {@linkcode @switchboard-xyz/common#FeedHash.compute} instead.
+   */
   static async fetchFeedHash(
     program: Program,
     params: {
@@ -122,7 +148,6 @@ export class Queue {
     const oracleSigs = await queueAccount.fetchSignatures(params);
     return Buffer.from(oracleSigs[0].feed_hash, "hex");
   }
-
 
   /**
    *  Constructs a `OnDemandQueue` instance.
@@ -176,7 +201,6 @@ export class Queue {
     const gateways = (await Promise.all(gatewaysPromises))
       .filter((gw: Gateway | null) => gw !== null)
       .sort(() => Math.random() - 0.5);
-    console.log(gateways);
     return gateways as Gateway[];
   }
 
@@ -362,5 +386,55 @@ export class Queue {
       );
     }
     return ixs;
+  }
+
+  /**
+   *  Fetches most recently added and verified Oracle Key.
+   *  @returns A promise that resolves to an oracle public key.
+   *  @throws if the request fails.
+   */
+  async fetchFreshOracle(): Promise<PublicKey> {
+    const coder = new BorshAccountsCoder(this.program.idl);
+    const now = Math.floor(+new Date() / 1000);
+    const oracles = await this.fetchOracleKeys();
+    const oracleAccounts = await utils.rpc.getMultipleAccounts(
+      this.program.provider.connection,
+      oracles
+    );
+    const zip: any = [];
+    for (let i = 0; i < oracles.length; i++) {
+      zip.push({
+        data: coder.decode(
+          "OracleAccountData",
+          oracleAccounts[i]!.account!.data
+        ),
+        key: oracles[i],
+      });
+    }
+    const validOracles = zip
+      .filter((x: any) => x.data.enclave.verificationStatus === 4) // value 4 is for verified
+      .filter((x: any) => x.data.enclave.validUntil > now + 3600); // valid for 1 hour at least
+    const chosen =
+      validOracles[Math.floor(Math.random() * validOracles.length)];
+    return chosen.key;
+  }
+
+  async loadLookupTable(): Promise<AddressLookupTableAccount> {
+    const data = await this.loadData();
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), this.pubkey.toBuffer()],
+        this.program.programId
+      )
+    )[0];
+    const [_, lutKey] = await AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: PublicKey.default,
+      recentSlot: data.lutSlot,
+    });
+    const accnt = await this.program.provider.connection.getAddressLookupTable(
+      lutKey
+    );
+    return accnt.value!;
   }
 }

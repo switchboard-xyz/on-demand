@@ -27,11 +27,16 @@ async function main() {
 
   fs.mkdirSync(outDir, { recursive: true });
 
-  execSync(`pnpm exec tsc --outDir lib`, { encoding: "utf-8" });
-
-  execSync(`pnpm exec tsc --outDir lib-cjs -p tsconfig.cjs.json`, {
+  execSync(`pnpm exec tsc --removeComments --outDir lib`, {
     encoding: "utf-8",
   });
+
+  execSync(
+    `pnpm exec tsc --removeComments --outDir lib-cjs -p tsconfig.cjs.json`,
+    {
+      encoding: "utf-8",
+    }
+  );
 
   await utils
     .moveCjsFilesAsync("lib-cjs", "lib")

@@ -69,19 +69,27 @@ export class State {
     guardianQueue?: PublicKey;
     newAuthority?: PublicKey;
     minQuoteVerifyVotes?: BN;
-    permitAdvisories?: Array<number>;
-    denyAdvisories?: Array<number>;
+    stakeProgram?: PublicKey;
+    stakePool?: PublicKey;
+    permitAdvisory?: number;
+    denyAdvisory?: number;
+    testOnlyDisableMrEnclaveCheck?: boolean;
   }): Promise<TransactionInstruction> {
     const state = await this.loadData();
     const queue = params.guardianQueue ?? state.guardianQueue;
     const program = this.program;
     const payer = (program.provider as any).wallet.payer;
+    const testOnlyDisableMrEnclaveCheck =
+      params.testOnlyDisableMrEnclaveCheck ??
+      state.testOnlyDisableMrEnclaveCheck;
     const ix = await this.program.instruction.stateSetConfigs(
       {
-        newAuthority: params.newAuthority ?? null,
-        minQuoteVerifyVotes: params.minQuoteVerifyVotes ?? null,
-        addAdvisories: params.permitAdvisories ?? [],
-        rmAdvisories: params.denyAdvisories ?? [],
+        newAuthority: params.newAuthority ?? state.authority,
+        stakeProgram: params.stakeProgram ?? state.stakeProgram,
+        stakePool: params.stakePool ?? state.stakePool,
+        addAdvisory: params.permitAdvisory,
+        rmAdvisory: params.denyAdvisory,
+        testOnlyDisableMrEnclaveCheck: testOnlyDisableMrEnclaveCheck ? 1 : 0,
       },
       {
         accounts: {
