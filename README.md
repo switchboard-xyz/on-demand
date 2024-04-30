@@ -40,16 +40,26 @@ function buildBinanceComJob(pair: String): OracleJob {
 }
 
 // ...
-const ixs = await PullFeed.solanaFetchUpdateIxs(program, {
-  feed: feedKp.publicKey,
-  queue,
-  jobs: [buildBinanceComJob("BTCUSDT")],
-  numSignatures: 1,
-  maxVariance: 1, // don't respond if sources give > 1% variance
-  minResponses: 1, // minimum job responses to resolve
-});
-const tx = await InstructionUtils.asV0Tx(program, ixs);
-tx.sign([payer, feedKp]);
+const conf = {
+    // the feed name (max 32 bytes)
+    name: "BTC Price Feed",
+    // the queue of oracles to bind to
+    queue,
+    // the jobs for the feed to perform
+    jobs: [
+      buildCoinbaseJob("BTC-USD"),
+    ],
+    // allow 1% variance between submissions and jobs
+    maxVariance: 1.0,
+    // minimum number of responses of jobs to allow
+    minResponses: 1,
+    // number of signatures to fetch per update
+    numSignatures: 3,
+};
+const pullFeed = new PullFeed(program, new PublicKey(argv.feed));
+const [priceUpdateIx] = await pullFeed.fetchUpdateIx(conf);
+const tx = await InstructionUtils.asV0Tx(program, [ixs]);
+tx.sign([payer]);
 await program.provider.connection.sendTransaction(tx, {
 // preflightCommitment is REQUIRED to be processed or disabled
 preflightCommitment: "processed",
