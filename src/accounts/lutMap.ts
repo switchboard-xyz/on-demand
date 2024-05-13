@@ -1,15 +1,19 @@
-import { State } from "./state.js";
 import { RecentSlotHashes } from "./../sysvars/recentSlothashes.js";
 import { Queue } from "./queue.js";
+import { State } from "./state.js";
+
 import type { BN, Program } from "@coral-xyz/anchor";
-import {
-  AddressLookupTableProgram,
+import * as spl from "@solana/spl-token";
+import type {
   AddressLookupTableState,
+  TransactionInstruction,
+} from "@solana/web3.js";
+import {
   AddressLookupTableAccount,
+  AddressLookupTableProgram,
   PublicKey,
   SystemProgram,
 } from "@solana/web3.js";
-import * as spl from "@solana/spl-token";
 
 /**
  *  A map of LUTs to their public keys.
@@ -72,6 +76,42 @@ export class LutMap {
   }
 
   constructor(readonly program: Program, readonly pubkey: PublicKey) {}
+
+  async queueLutExtendIx(params: {
+    queue: PublicKey;
+    newKey: PublicKey;
+    payer: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const payer = (this.program.provider as any).wallet.payer;
+    const queueAccount = new Queue(this.program, params.queue);
+    const queueData = await queueAccount.loadData();
+    const lutKey = await LutMap.keyFromSeed(
+      this.program,
+      params.queue,
+      payer.publicKey
+    );
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), params.queue.toBuffer()],
+        this.program.programId
+      )
+    )[0];
+    const ix = await this.program.instruction.queueLutExtend(
+      { newKey: params.newKey },
+      {
+        accounts: {
+          queue: params.queue,
+          authority: queueData.authority,
+          lutSigner,
+          lut: lutKey,
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
+          payer: payer.publicKey,
+          systemProgram: SystemProgram.programId,
+        },
+      }
+    );
+    return ix;
+  }
 
   /**
    *  Loads the data for this {@linkcode LutMap} account from on chain.

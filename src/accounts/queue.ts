@@ -1,3 +1,4 @@
+import { SB_ON_DEMAND_PID } from "../constants.js";
 import type { FeedEvalResponse } from "../oracle-interfaces/gateway.js";
 import { Gateway } from "../oracle-interfaces/gateway.js";
 
@@ -48,8 +49,11 @@ export class Queue {
       maxQuoteVerificationAge?: number;
       reward?: number;
       nodeTimeout?: number;
+      lutSlot?: number;
     }
   ): Promise<[Queue, Keypair, TransactionInstruction]> {
+    const stateKey = State.keyFromSeed(program);
+    const state = await State.loadData(program);
     const queue = Keypair.generate();
     const allowAuthorityOverrideAfter =
       params.allowAuthorityOverrideAfter ?? 60 * 60;
@@ -68,13 +72,29 @@ export class Queue {
         program.programId
       )
     )[0];
-    const recentSlot = await program.provider.connection.getSlot("finalized");
+    const [delegationGroup] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Group"),
+        stateKey.toBuffer(),
+        state.stakePool.toBuffer(),
+        queue.publicKey.toBuffer(),
+      ],
+      state.stakeProgram
+    );
+    const recentSlot =
+      params.lutSlot ??
+      (await program.provider.connection.getSlot("finalized"));
     const [_, lut] = AddressLookupTableProgram.createLookupTable({
       authority: lutSigner,
       payer: payer.publicKey,
       recentSlot,
     });
 
+    let stakePool = state.stakePool;
+    if (stakePool.equals(PublicKey.default)) {
+      stakePool = payer.publicKey;
+    }
+    const queueAccount = new Queue(program, queue.publicKey);
     const ix = await program.instruction.queueInit(
       {
         allowAuthorityOverrideAfter,
@@ -83,22 +103,79 @@ export class Queue {
         maxQuoteVerificationAge,
         reward,
         nodeTimeout,
-        recentSlot,
+        recentSlot: new anchor.BN(recentSlot),
       },
       {
         accounts: {
           queue: queue.publicKey,
+          queueEscrow: await spl.getAssociatedTokenAddress(
+            spl.NATIVE_MINT,
+            queue.publicKey
+          ),
           authority: payer.publicKey,
           payer: payer.publicKey,
           systemProgram: SystemProgram.programId,
           tokenProgram: spl.TOKEN_PROGRAM_ID,
-          tokenMint: spl.NATIVE_MINT,
+          nativeMint: spl.NATIVE_MINT,
           programState: State.keyFromSeed(program),
+          lutSigner: await queueAccount.lutSigner(),
+          lut: await queueAccount.lutKey(recentSlot),
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
+          delegationGroup,
+          stakeProgram: state.stakeProgram,
+          stakePool: stakePool,
+          associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
         },
         signers: [payer, queue],
       }
     );
     return [new Queue(program, queue.publicKey), queue, ix];
+  }
+
+  async initDelegationGroupIx(
+    lutSlot: number
+  ): Promise<TransactionInstruction> {
+    const payer = (this.program.provider as any).wallet.payer;
+    const stateKey = State.keyFromSeed(this.program);
+    const state = await State.loadData(this.program);
+    const [delegationGroup] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Group"),
+        stateKey.toBuffer(),
+        state.stakePool.toBuffer(),
+        this.pubkey.toBuffer(),
+      ],
+      state.stakeProgram
+    );
+    const [queueEscrowSigner] = await PublicKey.findProgramAddress(
+      [Buffer.from("Signer"), this.pubkey.toBuffer()],
+      SB_ON_DEMAND_PID
+    );
+    const ix = await this.program.instruction.queueInitDelegationGroup(
+      {},
+      {
+        accounts: {
+          queue: this.pubkey,
+          queueEscrow: await spl.getAssociatedTokenAddress(
+            spl.NATIVE_MINT,
+            this.pubkey
+          ),
+          queueEscrowSigner,
+          payer: payer.publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: spl.TOKEN_PROGRAM_ID,
+          nativeMint: spl.NATIVE_MINT,
+          programState: stateKey,
+          lutSigner: await this.lutSigner(),
+          lut: await this.lutKey(lutSlot),
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
+          delegationGroup: delegationGroup,
+          stakeProgram: state.stakeProgram,
+          stakePool: state.stakePool,
+        },
+      }
+    );
+    return ix;
   }
 
   /**
@@ -419,19 +496,28 @@ export class Queue {
     return chosen.key;
   }
 
-  async loadLookupTable(): Promise<AddressLookupTableAccount> {
-    const data = await this.loadData();
-    const lutSigner = (
+  async lutSigner(): Promise<PublicKey> {
+    return (
       await PublicKey.findProgramAddress(
         [Buffer.from("LutSigner"), this.pubkey.toBuffer()],
         this.program.programId
       )
     )[0];
+  }
+
+  async lutKey(lutSlot: number): Promise<PublicKey> {
+    const lutSigner = await this.lutSigner();
     const [_, lutKey] = await AddressLookupTableProgram.createLookupTable({
       authority: lutSigner,
       payer: PublicKey.default,
-      recentSlot: data.lutSlot,
+      recentSlot: lutSlot,
     });
+    return lutKey;
+  }
+
+  async loadLookupTable(): Promise<AddressLookupTableAccount> {
+    const data = await this.loadData();
+    const lutKey = await this.lutKey(data.lutSlot);
     const accnt = await this.program.provider.connection.getAddressLookupTable(
       lutKey
     );

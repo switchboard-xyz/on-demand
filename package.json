@@ -1,6 +1,6 @@
 {
   "name": "@switchboard-xyz/on-demand",
-  "version": "1.0.49",
+  "version": "1.0.54",
   "description": "A Typescript client to interact with Switchboard On-Demand.",
   "license": "ISC",
   "type": "module",

@@ -29,6 +29,12 @@ import { FeedHash } from "@switchboard-xyz/common";
 import Big from "big.js";
 const crypto = require("crypto");
 
+type OracleResponse = {
+  oracle: Oracle;
+  value: Big | null;
+  error: string;
+};
+
 function padStringWithNullBytes(
   input: string,
   desiredLength: number = 32
@@ -105,6 +111,7 @@ export class PullFeed {
       jobs: IOracleJob[];
       maxVariance: number;
       minResponses: number;
+      payer?: PublicKey;
     }
   ): Promise<VersionedTransaction> {
     const ix = await this.initIx(params);
@@ -126,8 +133,12 @@ export class PullFeed {
     jobs: IOracleJob[];
     maxVariance: number;
     minResponses: number;
+    ipfsHash?: string;
+    payer?: PublicKey;
   }): Promise<TransactionInstruction> {
-    const payer = (this.program.provider as any).wallet.payer;
+    const ipfsHash = params.ipfsHash ?? new Uint8Array(32);
+    const payerPublicKey =
+      params.payer ?? (this.program.provider as any).wallet.payer.publicKey;
     const maxVariance = Math.floor(params.maxVariance * 1e9);
     const jobs = params.jobs;
     const feedHash = FeedHash.compute(params.queue.toBuffer(), jobs);
@@ -142,7 +153,7 @@ export class PullFeed {
     );
     const [_, lut] = AddressLookupTableProgram.createLookupTable({
       authority: lutSigner,
-      payer: payer.publicKey,
+      payer: payerPublicKey,
       recentSlot,
     });
     const ix = this.program.instruction.pullFeedInit(
@@ -151,14 +162,15 @@ export class PullFeed {
         maxVariance: new anchor.BN(maxVariance),
         minResponses: params.minResponses,
         name: Buffer.from(padStringWithNullBytes(params.name)),
-        recentSlot: new anchor.BN(recentSlot.toString()),
+        recentSlot: new anchor.BN(recentSlot),
+        ipfsHash: new Uint8Array(32),
       },
       {
         accounts: {
           pullFeed: this.pubkey,
           queue: params.queue,
-          payer: payer.publicKey,
-          authority: payer.publicKey,
+          authority: payerPublicKey,
+          payer: payerPublicKey,
           systemProgram: SystemProgram.programId,
           programState: State.keyFromSeed(this.program),
           rewardEscrow: spl.getAssociatedTokenAddressSync(
@@ -196,13 +208,8 @@ export class PullFeed {
     minResponses?: number;
   }): Promise<TransactionInstruction> {
     const data = await this.loadData();
-    const payer = (this.program.provider as any).wallet.payer;
-    const signers = [payer];
-    if (params.authority) {
-      signers.push(params.authority);
-    }
     const jobs = params.jobs;
-    const feedHash = jobs
+    const feedHash = jobs?.length
       ? FeedHash.compute(data.queue.toBuffer(), jobs)
       : null;
     const name =
@@ -212,10 +219,11 @@ export class PullFeed {
     const ix = this.program.instruction.pullFeedSetConfigs(
       {
         name,
-        feedHash: feedHash ?? null,
+        feedHash,
         authority: params.authority ?? null,
         maxVariance: params.maxVariance ?? null,
         minResponses: params.minResponses ?? null,
+        ipfs_hash: null,
       },
       {
         accounts: {
@@ -239,7 +247,7 @@ export class PullFeed {
     recentSlothashes?: Array<[anchor.BN, string]>,
     priceSignatures?: FeedEvalResponse[],
     debug: boolean = false
-  ): Promise<[TransactionInstruction, Oracle[], any[]]> {
+  ): Promise<[TransactionInstruction | undefined, OracleResponse[], number]> {
     const params = {
       feed: this.pubkey,
       ...params_,
@@ -282,8 +290,9 @@ export class PullFeed {
     },
     recentSlothashes?: Array<[anchor.BN, string]>,
     priceSignatures?: FeedEvalResponse[],
-    debug: boolean = false
-  ): Promise<[TransactionInstruction, Oracle[], any[]]> {
+    debug: boolean = false,
+    payer?: PublicKey
+  ): Promise<[TransactionInstruction | undefined, OracleResponse[], number]> {
     const slotHashes =
       recentSlothashes ??
       (await RecentSlotHashes.fetchLatestNSlothashes(
@@ -295,10 +304,24 @@ export class PullFeed {
     const feed = new PullFeed(program, params.feed);
     priceSignatures =
       priceSignatures ?? (await Queue.fetchSignatures(program, params));
-    const oracles = priceSignatures.map(
-      (x) =>
-        new Oracle(program, new PublicKey(Buffer.from(x.oracle_pubkey, "hex")))
-    );
+    let numSuccesses = 0;
+    const oracleResponses = priceSignatures.map((x) => {
+      const oldDP = Big.DP;
+      Big.DP = 40;
+      const value = x.success_value ? new Big(x.success_value).div(1e18) : null;
+      if (value !== null) {
+        numSuccesses += 1;
+      }
+      Big.DP = oldDP;
+      return {
+        value,
+        error: x.failure_error,
+        oracle: new Oracle(
+          program,
+          new PublicKey(Buffer.from(x.oracle_pubkey, "hex"))
+        ),
+      };
+    });
 
     const offsets: number[] = new Array(priceSignatures.length).fill(0);
     for (let i = 0; i < priceSignatures.length; i++) {
@@ -324,19 +347,16 @@ export class PullFeed {
     if (debug) {
       console.log("priceSignatures", priceSignatures);
     }
-    const failures: any[] = [];
-    priceSignatures = priceSignatures.filter((x, idx) => {
-      if (x.failure_error.length > 0) {
-        failures.push({ idx, error: x.failure_error });
-        return false;
-      }
-      return true;
-    });
-    return [
-      await feed.submitSignaturesIx(priceSignatures, offsets, slotHashes[0][0]),
-      oracles,
-      failures,
-    ];
+    let submitSignaturesIx: TransactionInstruction | undefined = undefined;
+    if (numSuccesses > 0) {
+      submitSignaturesIx = await feed.solanaSubmitSignaturesIx({
+        resps: priceSignatures,
+        offsets: offsets,
+        slot: slotHashes[0][0],
+        payer,
+      });
+    }
+    return [submitSignaturesIx, oracleResponses, numSuccesses];
   }
 
   /**
@@ -346,17 +366,19 @@ export class PullFeed {
    *  @param slot The slot at which the oracles signed the feed with the current slothash.
    *  @returns A promise that resolves to the transaction instruction.
    */
-  async submitSignaturesIx(
-    resps: FeedEvalResponse[],
-    offsets: number[],
-    slot: anchor.BN
-  ): Promise<TransactionInstruction> {
+  async solanaSubmitSignaturesIx(params: {
+    resps: FeedEvalResponse[];
+    offsets: number[];
+    slot: anchor.BN;
+    payer?: PublicKey;
+  }): Promise<TransactionInstruction> {
     const program = this.program;
-    const payer = (program.provider as any).wallet.payer;
+    const payerPublicKey =
+      params.payer ?? (program.provider as any).wallet.payer.publicKey;
     const queue = new PublicKey(
-      Buffer.from(resps[0].queue_pubkey.toString(), "hex")
+      Buffer.from(params.resps[0].queue_pubkey.toString(), "hex")
     );
-    const oracles = resps.map(
+    const oracles = params.resps.map(
       (x) => new PublicKey(Buffer.from(x.oracle_pubkey.toString(), "hex"))
     );
     const oracleFeedStats = oracles.map(
@@ -366,14 +388,14 @@ export class PullFeed {
           program.programId
         )[0]
     );
-    const submissions = resps.map((resp, idx) => ({
+    const submissions = params.resps.map((resp, idx) => ({
       value: new anchor.BN(resp.success_value.toString()),
       signature: resp.signature,
       recoveryId: resp.recovery_id,
-      slotOffset: offsets[idx],
+      slotOffset: params.offsets[idx],
     }));
     const instructionData = {
-      slot: new anchor.BN(slot),
+      slot: new anchor.BN(params.slot),
       submissions: submissions.map((x: any) => {
         x.signature = Buffer.from(x.signature, "base64");
         return x;
@@ -385,7 +407,7 @@ export class PullFeed {
       queue: queue,
       programState: State.keyFromSeed(program),
       recentSlothashes: SLOT_HASHES_SYSVAR_ID,
-      payer: payer.publicKey,
+      payer: payerPublicKey,
       systemProgram: SystemProgram.programId,
       feedRewardEscrow: spl.getAssociatedTokenAddressSync(
         spl.NATIVE_MINT,

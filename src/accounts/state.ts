@@ -1,8 +1,7 @@
 import { Queue } from "./queue.js";
 
 import type { BN, Program } from "@coral-xyz/anchor";
-import type { TransactionInstruction } from "@solana/web3.js";
-import { PublicKey, SystemProgram } from "@solana/web3.js";
+import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
 
 /**
  *  Abstraction around the Switchboard-On-Demand State account
@@ -74,6 +73,10 @@ export class State {
     permitAdvisory?: number;
     denyAdvisory?: number;
     testOnlyDisableMrEnclaveCheck?: boolean;
+    switchMint?: PublicKey;
+    epochLength?: BN;
+    resetEpochs?: boolean;
+    enableStaking?: boolean;
   }): Promise<TransactionInstruction> {
     const state = await this.loadData();
     const queue = params.guardianQueue ?? state.guardianQueue;
@@ -82,18 +85,26 @@ export class State {
     const testOnlyDisableMrEnclaveCheck =
       params.testOnlyDisableMrEnclaveCheck ??
       state.testOnlyDisableMrEnclaveCheck;
+    const resetEpochs = params.resetEpochs ?? false;
     const ix = await this.program.instruction.stateSetConfigs(
       {
         newAuthority: params.newAuthority ?? state.authority,
-        stakeProgram: params.stakeProgram ?? state.stakeProgram,
+        testOnlyDisableMrEnclaveCheck: testOnlyDisableMrEnclaveCheck ? 1 : 0,
         stakePool: params.stakePool ?? state.stakePool,
+        stakeProgram: params.stakeProgram ?? state.stakeProgram,
         addAdvisory: params.permitAdvisory,
         rmAdvisory: params.denyAdvisory,
-        testOnlyDisableMrEnclaveCheck: testOnlyDisableMrEnclaveCheck ? 1 : 0,
+        epochLength: params.epochLength ?? state.epochLength,
+        resetEpochs: resetEpochs,
+        lutSlot: state.lutSlot,
+        switchMint: params.switchMint ?? state.switchMint,
+        enableStaking: params.enableStaking ?? state.enableStaking,
+        authority: params.newAuthority ?? state.authority,
       },
       {
         accounts: {
           state: this.pubkey,
+          authority: state.authority,
           queue,
           payer: payer.publicKey,
           systemProgram: SystemProgram.programId,

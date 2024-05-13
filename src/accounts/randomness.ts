@@ -178,11 +178,11 @@ export class Randomness {
           authority: data.authority,
           payer: this.program.provider.publicKey!,
           recentSlothashes: SLOT_HASHES_SYSVAR_ID,
+          systemProgram: SystemProgram.programId,
           rewardEscrow: spl.getAssociatedTokenAddressSync(
             spl.NATIVE_MINT,
             this.pubkey
           ),
-          systemProgram: SystemProgram.programId,
           tokenProgram: spl.TOKEN_PROGRAM_ID,
           associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
           wrappedSolMint: spl.NATIVE_MINT,

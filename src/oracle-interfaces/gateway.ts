@@ -199,7 +199,7 @@ export class Gateway {
     try {
       const response = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
-      await response.text();
+      const txt = await response.text();
       return true;
     } catch {}
     return false;
