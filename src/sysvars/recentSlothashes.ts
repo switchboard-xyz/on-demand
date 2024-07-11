@@ -1,6 +1,6 @@
 import { SLOT_HASHES_SYSVAR_ID } from "../constants.js";
 
-import * as anchor from "@coral-xyz/anchor";
+import * as anchor from "@coral-xyz/anchor-30";
 import type { Connection } from "@solana/web3.js";
 import bs58 from "bs58";
 

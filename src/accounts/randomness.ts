@@ -4,13 +4,18 @@ import { Gateway } from "../oracle-interfaces/gateway.js";
 
 import { InstructionUtils } from "./../instruction-utils/InstructionUtils.js";
 import { RecentSlotHashes } from "./../sysvars/recentSlothashes.js";
+import * as spl from "./../utils/index.js";
 import { Oracle } from "./oracle.js";
 import { Queue } from "./queue.js";
 import { State } from "./state.js";
 
-import { BN, BorshAccountsCoder, type Program, utils } from "@coral-xyz/anchor";
-import * as anchor from "@coral-xyz/anchor";
-import * as spl from "@solana/spl-token";
+import {
+  BN,
+  BorshAccountsCoder,
+  type Program,
+  utils,
+} from "@coral-xyz/anchor-30";
+import * as anchor from "@coral-xyz/anchor-30";
 import type { TransactionInstruction } from "@solana/web3.js";
 import {
   AddressLookupTableAccount,
@@ -57,7 +62,9 @@ export class Randomness {
    *  @throws if the randomness account does not exist.
    */
   async loadData(): Promise<any> {
-    return await this.program.account.randomnessAccountData.fetch(this.pubkey);
+    return await this.program.account["randomnessAccountData"].fetch(
+      this.pubkey
+    );
   }
 
   /**
@@ -221,12 +228,15 @@ export class Randomness {
         console.log("Randomness slot already committed. Jumping to reveal.");
         break;
       }
-      const tx = await InstructionUtils.asV0Tx(this.program, [
-        ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: computeUnitPrice,
-        }),
-        await this.commitIx(oracle),
-      ]);
+      const tx = await InstructionUtils.asV0TxWithComputeIxs({
+        connection: this.program.provider.connection,
+        ixs: [
+          ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: computeUnitPrice,
+          }),
+          await this.commitIx(oracle),
+        ],
+      });
       tx.sign([payer]);
       const sim = await connection.simulateTransaction(tx, {
         commitment: "processed",
@@ -278,14 +288,18 @@ export class Randomness {
         await new Promise((f) => setTimeout(f, 1000));
         continue;
       }
-      const tx = await InstructionUtils.asV0Tx(this.program, [
-        ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: computeUnitPrice,
-        }),
-        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
-        revealIx!,
-        ...callback,
-      ]);
+      const tx = await InstructionUtils.asV0TxWithComputeIxs({
+        connection: this.program.provider.connection,
+        ixs: [
+          ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: computeUnitPrice,
+          }),
+          ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+          revealIx!,
+          ...callback,
+        ],
+      });
+
       tx.sign(signers);
       const sim = await connection.simulateTransaction(tx, {
         commitment: "processed",
@@ -327,7 +341,11 @@ export class Randomness {
     revealIxs: TransactionInstruction[],
     fileName: string = "serializedIx.bin"
   ): Promise<void> {
-    const tx = await InstructionUtils.asV0Tx(this.program, revealIxs);
+    const tx = await InstructionUtils.asV0TxWithComputeIxs({
+      connection: this.program.provider.connection,
+      ixs: revealIxs,
+      payer: PublicKey.default,
+    });
 
     fs.writeFile(fileName, tx.serialize(), (err) => {
       if (err) {

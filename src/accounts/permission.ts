@@ -1,4 +1,4 @@
-import type { Program } from "@coral-xyz/anchor";
+import type { Program } from "@coral-xyz/anchor-30";
 import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
 
 export enum SwitchboardPermission {

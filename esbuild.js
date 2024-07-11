@@ -13,12 +13,12 @@ const __dirname = path.dirname(__filename);
 
 const buildFiles = ["tsconfig.tsbuildinfo"];
 
-const outDir = path.join(__dirname, "lib");
+const outDir = path.join(__dirname, "dist");
 
 async function main() {
   await Promise.all([
     fsPromises.rm(outDir, { recursive: true, force: true }),
-    fsPromises.rm(path.join(__dirname, "lib-cjs"), {
+    fsPromises.rm(path.join(__dirname, "dist-cjs"), {
       recursive: true,
       force: true,
     }),
@@ -27,23 +27,23 @@ async function main() {
 
   fs.mkdirSync(outDir, { recursive: true });
 
-  execSync(`pnpm exec tsc --removeComments --outDir lib`, {
+  execSync(`pnpm exec tsc --removeComments --outDir dist`, {
     encoding: "utf-8",
   });
 
   execSync(
-    `pnpm exec tsc --removeComments --outDir lib-cjs -p tsconfig.cjs.json`,
+    `pnpm exec tsc --removeComments --outDir dist-cjs -p tsconfig.cjs.json`,
     {
       encoding: "utf-8",
     }
   );
 
   await utils
-    .moveCjsFilesAsync("lib-cjs", "lib")
-    .then(() => fsPromises.rm("lib-cjs", { recursive: true, force: true }));
+    .moveCjsFilesAsync("dist-cjs", "dist")
+    .then(() => fsPromises.rm("dist-cjs", { recursive: true, force: true }));
 
   console.log(`Generating entrypoints ...`);
-  utils.generateEntrypoints(__dirname, "lib", {
+  utils.generateEntrypoints(__dirname, "dist", {
     index: "index",
   });
 }

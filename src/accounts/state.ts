@@ -1,7 +1,8 @@
 import { Queue } from "./queue.js";
 
-import type { BN, Program } from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
+import type { BN, Program } from "@coral-xyz/anchor-30";
+import type { TransactionInstruction } from "@solana/web3.js";
+import { PublicKey, SystemProgram } from "@solana/web3.js";
 
 /**
  *  Abstraction around the Switchboard-On-Demand State account
@@ -178,7 +179,7 @@ export class State {
    *  @throws if the state account does not exist.
    */
   async loadData(): Promise<any> {
-    return await this.program.account.state.fetch(this.pubkey);
+    return await this.program.account["state"].fetch(this.pubkey);
   }
 
   /**

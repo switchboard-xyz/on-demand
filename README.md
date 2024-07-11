@@ -21,38 +21,20 @@ Switchboard On-Demand is ideal for blockchain-based financial applications and s
 - **High-Fidelity Financial Applications**: Designed with financial applications in mind, Switchboard ensures high accuracy and reliability for transactions and data handling.
 
 ## Getting Started
-To start building your own on-demand oracle with Switchboard, you can refer to the oracle specification in our [documentation](https://docs.switchboard.xyz/api/protos/Task).
+To start building your own on-demand oracle with Switchboard, you can refer to the oracle specification in our [documentation](https://protos.docs.switchboard.xyz/protos/OracleJob).
 
 ### Example Code Snippet:
 ```typescript
-function buildBinanceComJob(pair: String): OracleJob {
-  const tasks = [
-    OracleJob.Task.create({
-      httpTask: OracleJob.HttpTask.create({
-        url: `https://www.binance.com/api/v3/ticker/price?symbol=${pair}`,
-      }),
-    }),
-    OracleJob.Task.create({
-      jsonParseTask: OracleJob.JsonParseTask.create({ path: "$.price" }),
-    }),
-  ];
-  return OracleJob.create({ tasks });
-}
-
-// ...
-const [ix] = await pullFeed.fetchUpdateIx(program, {
-  feed: feedKp.publicKey,
-  queue,
-  jobs: [buildBinanceComJob("BTCUSDT")],
-  numSignatures: 1,
-  maxVariance: 1, // don't respond if sources give > 1% variance
-  minResponses: 1, // minimum job responses to resolve
-  numSignatures: 3,
+const [pullIx] = await feedAccount.fetchUpdateIx({ numSignatures: 3 });
+const tx = await sb.asV0Tx({
+    connection,
+    ixs: [pullIx],
+    signers: [payer],
+    computeUnitPrice: 200_000,
+    computeUnitLimitMultiple: 1.3,
 });
-const tx = await InstructionUtils.asV0Tx(program, [ix]);
-tx.sign([payer]);
 await program.provider.connection.sendTransaction(tx, {
-// preflightCommitment is REQUIRED to be processed or disabled
-preflightCommitment: "processed",
+    // preflightCommitment is REQUIRED to be processed or disabled
+    preflightCommitment: "processed",
 });
-
+```

@@ -1,9 +1,9 @@
 import { RecentSlotHashes } from "./../sysvars/recentSlothashes.js";
+import * as spl from "./../utils/index.js";
 import { Queue } from "./queue.js";
 import { State } from "./state.js";
 
-import type { BN, Program } from "@coral-xyz/anchor";
-import * as spl from "@solana/spl-token";
+import type { BN, Program } from "@coral-xyz/anchor-30";
 import type {
   AddressLookupTableState,
   TransactionInstruction,
@@ -120,7 +120,7 @@ export class LutMap {
    *  @throws if the account does not exist.
    */
   async loadData(): Promise<any> {
-    return await this.program.account.lutMapAccountData.fetch(this.pubkey);
+    return await this.program.account["lutMapAccountData"].fetch(this.pubkey);
   }
 
   async loadLut(): Promise<[PublicKey, AddressLookupTableState]> {

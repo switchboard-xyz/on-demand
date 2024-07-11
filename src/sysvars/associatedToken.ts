@@ -1,6 +1,7 @@
 import { SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID } from "../constants.js";
 
-import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { TOKEN_PROGRAM_ID } from "./../utils/index.js";
+
 import { PublicKey } from "@solana/web3.js";
 
 export class AssociatedTokenProgram {

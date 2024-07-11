@@ -4,9 +4,8 @@
   "compilerOptions": {
     "lib": ["ES2021", "ES2022.Object", "DOM"],
     "composite": true,
-    "sourceMap": true,
-    "inlineSourceMap": false,
-    "inlineSources": false,
+    "inlineSourceMap": true,
+    "inlineSources": true,
     "declaration": true,
     "declarationMap": true,
     "allowSyntheticDefaultImports": true,

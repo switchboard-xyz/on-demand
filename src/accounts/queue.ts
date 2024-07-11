@@ -1,14 +1,18 @@
 import { SB_ON_DEMAND_PID } from "../constants.js";
-import type { FeedEvalResponse } from "../oracle-interfaces/gateway.js";
+import type {
+  FeedEvalResponse,
+  FetchSignaturesMultiResponse,
+} from "../oracle-interfaces/gateway.js";
 import { Gateway } from "../oracle-interfaces/gateway.js";
 
+import * as spl from "./../utils/index.js";
 import type { SwitchboardPermission } from "./permission.js";
 import { Permission } from "./permission.js";
+import type { FeedRequest } from "./pullFeed.js";
 import { State } from "./state.js";
 
-import * as anchor from "@coral-xyz/anchor";
-import { BorshAccountsCoder, type Program, utils } from "@coral-xyz/anchor";
-import * as spl from "@solana/spl-token";
+import * as anchor from "@coral-xyz/anchor-30";
+import { BorshAccountsCoder, type Program, utils } from "@coral-xyz/anchor-30";
 import type {
   AddressLookupTableAccount,
   TransactionInstruction,
@@ -21,6 +25,18 @@ import {
 } from "@solana/web3.js";
 import { FeedHash, type OracleJob } from "@switchboard-xyz/common";
 
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number
+): Promise<T | null> {
+  // Create a timeout promise that resolves to null after timeoutMs milliseconds
+  const timeoutPromise = new Promise<null>((resolve) =>
+    setTimeout(resolve, timeoutMs, null)
+  );
+
+  // Race the timeout promise against the original promise
+  return Promise.race([promise, timeoutPromise]);
+}
 /**
  *  Removes trailing null bytes from a string.
  *
@@ -32,6 +48,29 @@ function removeTrailingNullBytes(input: string): string {
   const trailingNullBytesRegex = /\x00+$/;
   // Remove trailing null bytes using the replace() method
   return input.replace(trailingNullBytesRegex, "");
+}
+
+function runWithTimeout<T>(
+  task: Promise<T>,
+  timeoutMs: number
+): Promise<T | "timeout"> {
+  return new Promise((resolve, reject) => {
+    // Set up the timeout
+    const timer = setTimeout(() => {
+      resolve("timeout");
+    }, timeoutMs);
+
+    task.then(
+      (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 /**
@@ -132,17 +171,21 @@ export class Queue {
     return [new Queue(program, queue.publicKey), queue, ix];
   }
 
-  async initDelegationGroupIx(
-    lutSlot: number
-  ): Promise<TransactionInstruction> {
+  async initDelegationGroupIx(params: {
+    lutSlot?: number;
+    overrideStakePool?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const queueAccount = new Queue(this.program, this.pubkey);
+    const lutSlot = params.lutSlot ?? (await this.loadData()).lutSlot;
     const payer = (this.program.provider as any).wallet.payer;
     const stateKey = State.keyFromSeed(this.program);
     const state = await State.loadData(this.program);
+    const stakePool = params.overrideStakePool ?? state.stakePool;
     const [delegationGroup] = await PublicKey.findProgramAddress(
       [
         Buffer.from("Group"),
         stateKey.toBuffer(),
-        state.stakePool.toBuffer(),
+        stakePool.toBuffer(),
         this.pubkey.toBuffer(),
       ],
       state.stakeProgram
@@ -171,7 +214,7 @@ export class Queue {
           addressLookupTableProgram: AddressLookupTableProgram.programId,
           delegationGroup: delegationGroup,
           stakeProgram: state.stakeProgram,
-          stakePool: state.stakePool,
+          stakePool: stakePool,
         },
       }
     );
@@ -205,6 +248,20 @@ export class Queue {
     return queueAccount.fetchSignatures(params);
   }
 
+  static async fetchSignaturesMulti(
+    program: Program,
+    params: {
+      gateway?: string;
+      queue: PublicKey;
+      recentHash?: string;
+      feedConfigs: FeedRequest[];
+      minResponses?: number;
+    }
+  ): Promise<FetchSignaturesMultiResponse> {
+    const queueAccount = new Queue(program, params.queue!);
+    return queueAccount.fetchSignaturesMulti(params);
+  }
+
   /**
    * @deprecated
    * Deprecated. Use {@linkcode @switchboard-xyz/common#FeedHash.compute} instead.
@@ -232,7 +289,11 @@ export class Queue {
    *  @param program The Anchor program instance.
    *  @param pubkey The public key of the queue account.
    */
-  constructor(readonly program: Program, readonly pubkey: PublicKey) {}
+  constructor(readonly program: Program, readonly pubkey: PublicKey) {
+    if (this.pubkey === undefined) {
+      throw new Error("NoPubkeyProvided");
+    }
+  }
 
   /**
    *  Loads the queue data from on chain and returns the listed oracle keys.
@@ -241,7 +302,7 @@ export class Queue {
    */
   async fetchOracleKeys(): Promise<PublicKey[]> {
     const program = this.program;
-    const queueData = (await program.account.queueAccountData.fetch(
+    const queueData = (await program.account["queueAccountData"].fetch(
       this.pubkey
     )) as any;
     const oracles = queueData.oracleKeys.slice(0, queueData.oracleKeysLen);
@@ -262,22 +323,31 @@ export class Queue {
       program.provider.connection,
       oracles
     );
-    const gatewaysPromises = oracleAccounts
-      .map((x: any) => coder.decode("OracleAccountData", x.account.data))
+    const gatewayUris = oracleAccounts
+      .map((x: any) => coder.decode("oracleAccountData", x.account.data))
       .map((x: any) => String.fromCharCode(...x.gatewayUri))
       .map((x: string) => removeTrailingNullBytes(x))
       .filter((x: string) => x.length > 0)
-      .map(async (uri: string) => {
-        const gw = new Gateway(program, uri);
-        if (await gw.test()) {
-          return gw;
-        }
-        return null;
-      });
+      .filter((x: string) => !x.includes("infstones"));
 
-    const gateways = (await Promise.all(gatewaysPromises))
-      .filter((gw: Gateway | null) => gw !== null)
-      .sort(() => Math.random() - 0.5);
+    const tests: any = [];
+    for (const i in gatewayUris) {
+      const gw = new Gateway(program, gatewayUris[i], oracles[i]);
+      tests.push(gw.test());
+    }
+
+    let gateways: any = [];
+    for (let i = 0; i < tests.length; i++) {
+      try {
+        const isGood = await withTimeout(tests[i], 2000);
+        if (isGood) {
+          gateways.push(new Gateway(program, gatewayUris[i], oracles[i]));
+        }
+      } catch (e) {
+        console.log("Timeout", e);
+      }
+    }
+    gateways = gateways.sort(() => Math.random() - 0.5);
     return gateways as Gateway[];
   }
 
@@ -317,7 +387,21 @@ export class Queue {
     if (params.gateway === undefined) {
       gateway = await this.fetchGateway();
     }
-    return gateway.fetchSignatures(params);
+    return await gateway.fetchSignatures(params);
+  }
+
+  async fetchSignaturesMulti(params: {
+    gateway?: string;
+    queue: PublicKey;
+    recentHash?: string;
+    feedConfigs: FeedRequest[];
+    minResponses?: number;
+  }): Promise<FetchSignaturesMultiResponse> {
+    let gateway = new Gateway(this.program, params.gateway ?? "");
+    if (params.gateway === undefined) {
+      gateway = await this.fetchGateway();
+    }
+    return await gateway.fetchSignaturesMulti(params);
   }
 
   /**
@@ -327,7 +411,7 @@ export class Queue {
    *  @throws if the queue account does not exist.
    */
   async loadData(): Promise<any> {
-    return await this.program.account.queueAccountData.fetch(this.pubkey);
+    return await this.program.account["queueAccountData"].fetch(this.pubkey);
   }
 
   /**
@@ -482,7 +566,7 @@ export class Queue {
     for (let i = 0; i < oracles.length; i++) {
       zip.push({
         data: coder.decode(
-          "OracleAccountData",
+          "oracleAccountData",
           oracleAccounts[i]!.account!.data
         ),
         key: oracles[i],

@@ -1,10 +1,10 @@
 import { InstructionUtils } from "./../instruction-utils/InstructionUtils.js";
+import * as spl from "./../utils/index.js";
 import { Queue } from "./queue.js";
 import { State } from "./state.js";
 
-import type { Program } from "@coral-xyz/anchor";
-import { BN, BorshAccountsCoder, utils } from "@coral-xyz/anchor";
-import * as spl from "@solana/spl-token";
+import type { Program } from "@coral-xyz/anchor-30";
+import { BN, BorshAccountsCoder, utils } from "@coral-xyz/anchor-30";
 import type {
   AddressLookupTableAccount,
   TransactionInstruction,
@@ -20,6 +20,8 @@ import {
  *  This class represents an oracle account on chain.
  */
 export class Oracle {
+  constructor(readonly program: Program, readonly pubkey: PublicKey) {}
+
   /**
    * Creates a new oracle account. linked to the specified queue.
    * After creation the oracle still must receive run approval and verify their
@@ -35,7 +37,7 @@ export class Oracle {
     params: {
       queue: PublicKey;
     }
-  ): Promise<[Oracle, string]> {
+  ): Promise<[Oracle, TransactionInstruction[], Keypair]> {
     const stateKey = State.keyFromSeed(program);
     const state = await State.loadData(program);
     const payer = (program.provider as any).wallet.payer;
@@ -72,6 +74,7 @@ export class Oracle {
         recentSlot: new BN(recentSlot.toString()),
         authority: payer.publicKey,
         queue: params.queue,
+        secpAuthority: null,
       },
       {
         accounts: {
@@ -142,15 +145,91 @@ export class Oracle {
         },
       }
     );
-    const queueAccount = new Queue(program, params.queue);
-    const queueLut = await queueAccount.loadLookupTable();
-    const tx = await InstructionUtils.asV0Tx(program, [ix, ix2], [queueLut]);
-    tx.sign([payer, oracle]);
-    const sig = await program.provider.connection.sendTransaction(tx);
-    return [new Oracle(program, oracle.publicKey), sig];
+    return [new Oracle(program, oracle.publicKey), [ix, ix2], oracle];
   }
 
-  constructor(readonly program: Program, readonly pubkey: PublicKey) {}
+  async updateDelegationRewardPoolsIx(params: {
+    overrideStakePool?: PublicKey;
+    overrideMint?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const program = this.program;
+    const stateKey = State.keyFromSeed(program);
+    const state = await State.loadData(program);
+    const switchMint = params.overrideMint ?? state.switchMint;
+    const stakePool = params.overrideStakePool ?? state.stakePool;
+    const stakeProgram = state.stakeProgram;
+    const payer = (program.provider as any).wallet.payer;
+    const oracleData = await this.loadData();
+    const oracleStats = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("OracleStats"), this.pubkey.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), this.pubkey.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const [delegationPool] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Delegation"),
+        stateKey.toBuffer(),
+        oracleStats.toBuffer(),
+        stakePool.toBuffer(),
+      ],
+      stakeProgram
+    );
+    const lutSlot = oracleData.lutSlot.toNumber();
+    const [_, lut] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot: lutSlot,
+    });
+    const ix = await program.instruction.oracleUpdateDelegation(
+      {
+        recentSlot: new BN(lutSlot.toString()),
+      },
+      {
+        accounts: {
+          oracle: this.pubkey,
+          oracleStats,
+          queue: oracleData.queue,
+          authority: stateKey,
+          programState: stateKey,
+          payer: payer.publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: spl.TOKEN_PROGRAM_ID,
+          delegationPool,
+          lutSigner,
+          lut,
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
+          switchMint: switchMint,
+          nativeMint: spl.NATIVE_MINT,
+          wsolVault: PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("RewardPool"),
+              delegationPool.toBuffer(),
+              spl.NATIVE_MINT.toBuffer(),
+            ],
+            stakeProgram
+          )[0],
+          switchVault: PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("RewardPool"),
+              delegationPool.toBuffer(),
+              switchMint.toBuffer(),
+            ],
+            stakeProgram
+          )[0],
+          stakeProgram: stakeProgram,
+          stakePool: stakePool,
+        },
+      }
+    );
+    return ix;
+  }
 
   async setConfigsIx(params: {
     authority: PublicKey;
@@ -159,6 +238,7 @@ export class Oracle {
     const ix = await this.program.instruction.oracleSetConfigs(
       {
         authority: params.authority,
+        newSecpAuthority: null,
       },
       {
         accounts: {
@@ -177,7 +257,7 @@ export class Oracle {
    *  @throws if the oracle account does not exist.
    */
   async loadData(): Promise<any> {
-    return await this.program.account.oracleAccountData.fetch(this.pubkey);
+    return await this.program.account["oracleAccountData"].fetch(this.pubkey);
   }
 
   /**
@@ -190,7 +270,7 @@ export class Oracle {
    */
   static async loadMany(program: Program, keys: PublicKey[]): Promise<any[]> {
     const coder = new BorshAccountsCoder(program.idl);
-    const accountType = "OracleAccountData";
+    const accountType = "oracleAccountData";
     const oracleDatas = await utils.rpc
       .getMultipleAccounts(program.provider.connection, keys)
       .then((o) => o.map((x) => coder.decode(accountType, x!.account.data)));
@@ -224,6 +304,19 @@ export class Oracle {
     const [_, lutKey] = await AddressLookupTableProgram.createLookupTable({
       authority: lutSigner,
       payer: payer.publicKey,
+      recentSlot: data.lutSlot,
+    });
+    return lutKey;
+  }
+
+  public lookupTableKey(data: any): PublicKey {
+    const lutSigner = PublicKey.findProgramAddressSync(
+      [Buffer.from("LutSigner"), this.pubkey.toBuffer()],
+      this.program.programId
+    )[0];
+    const [_, lutKey] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: PublicKey.default,
       recentSlot: data.lutSlot,
     });
     return lutKey;

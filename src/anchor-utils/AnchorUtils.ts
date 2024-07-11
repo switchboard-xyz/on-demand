@@ -1,8 +1,8 @@
 import { SB_ON_DEMAND_PID } from "./../constants.js";
 
-import * as anchor from "@coral-xyz/anchor";
+import * as anchor from "@coral-xyz/anchor-30";
 import type { Commitment } from "@solana/web3.js";
-import { Connection, Keypair } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import * as fs from "fs";
 import yaml from "js-yaml";
 import os from "os";
@@ -57,8 +57,8 @@ export class AnchorUtils {
       SB_ON_DEMAND_PID,
       config.provider
     ))!;
-    const program = new anchor.Program(idl, SB_ON_DEMAND_PID, config.provider);
-    return new anchor.Program(idl, SB_ON_DEMAND_PID, config.provider);
+    const program = new anchor.Program(idl, config.provider);
+    return new anchor.Program(idl, config.provider);
   }
 
   static async loadEnv(): Promise<SolanaConfig> {
@@ -107,9 +107,24 @@ export class AnchorUtils {
       SB_ON_DEMAND_PID,
       config.provider
     ))!;
-    const program = new anchor.Program(idl, SB_ON_DEMAND_PID, config.provider);
+    const program = new anchor.Program(idl, config.provider);
     config.program = program;
 
     return config;
+  }
+
+  static loggedEvents(program: anchor.Program, logs: string[]): any[] {
+    const coder = new anchor.BorshEventCoder(program.idl);
+    const out: any[] = [];
+    logs.forEach((log) => {
+      if (log.startsWith("Program data: ")) {
+        const strings = log.split(" ");
+        if (strings.length !== 3) return;
+        try {
+          out.push(coder.decode(strings[2]));
+        } catch {}
+      }
+    });
+    return out;
   }
 }
