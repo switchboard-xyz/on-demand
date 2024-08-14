@@ -26,9 +26,48 @@ import {
   PublicKey,
   SystemProgram,
 } from "@solana/web3.js";
-import type { IOracleJob, OracleJob } from "@switchboard-xyz/common";
+import type { IOracleJob } from "@switchboard-xyz/common";
+import { OracleJob } from "@switchboard-xyz/common";
 import { CrossbarClient, FeedHash } from "@switchboard-xyz/common";
 import Big from "big.js";
+
+const PRECISION = 18;
+
+export interface CurrentResult {
+  value: BN;
+  stdDev: BN;
+  mean: BN;
+  range: BN;
+  minValue: BN;
+  maxValue: BN;
+  slot: BN;
+  minSlot: BN;
+  maxSlot: BN;
+}
+
+export interface OracleSubmission {
+  oracle: PublicKey;
+  slot: BN;
+  value: BN;
+}
+
+export interface PullFeedAccountData {
+  submissions: OracleSubmission[];
+  authority: PublicKey;
+  queue: PublicKey;
+  feedHash: Buffer;
+  initializedAt: BN;
+  permissions: BN;
+  maxVariance: BN;
+  minResponses: number;
+  name: Buffer;
+  sampleSize: number;
+  lastUpdateTimestamp: BN;
+  lutSlot: BN;
+  result: CurrentResult;
+  maxStaleness: number;
+  minSampleSize: number;
+}
 
 export type MultiSubmission = {
   values: anchor.BN[];
@@ -104,15 +143,27 @@ async function checkNeedsInit(
 export class PullFeed {
   gatewayUrl: string;
   pubkey: PublicKey;
+  configs: {
+    queue: PublicKey;
+    maxVariance: number;
+    minResponses: number;
+    feedHash: Buffer;
+    minSampleSize: number;
+  } | null;
+  jobs: IOracleJob[] | null;
+  lut: AddressLookupTableAccount | null;
+
   /**
-   *  Constructs a `PullFeed` instance.
+   * Constructs a `PullFeed` instance.
    *
-   *  @param program The Anchor program instance.
-   *  @param pubkey The public key of the pull feed account.
+   * @param program - The Anchor program instance.
+   * @param pubkey - The public key of the pull feed account.
    */
   constructor(readonly program: Program, pubkey: PublicKey | string) {
     this.gatewayUrl = "";
     this.pubkey = new PublicKey(pubkey);
+    this.configs = null;
+    this.jobs = null;
   }
 
   static generate(program: Program): [PullFeed, Keypair] {
@@ -167,16 +218,16 @@ export class PullFeed {
   }
 
   /**
-   *  Initializes a pull feed account.
+   * Initializes a pull feed account.
    *
-   *  @param program The Anchor program instance.
-   *  @param queue The queue account public key.
-   *  @param jobs The oracle jobs to execute.
-   *  @param maxVariance The maximum variance allowed for the feed.
-   *  @param minResponses The minimum number of job responses required.
-   *  @param minSampleSize The minimum number of samples required for setting feed value
-   *  @param maxStaleness The maximum number of slots that can pass before a feed value is considered stale.
-   *  @returns A promise that resolves to a tuple containing the pull feed instance and the transaction signature.
+   * @param {anchor.Program} program - The Anchor program instance.
+   * @param {PublicKey} queue - The queue account public key.
+   * @param {Array<OracleJob>} jobs - The oracle jobs to execute.
+   * @param {number} maxVariance - The maximum variance allowed for the feed.
+   * @param {number} minResponses - The minimum number of job responses required.
+   * @param {number} minSampleSize - The minimum number of samples required for setting feed value.
+   * @param {number} maxStaleness - The maximum number of slots that can pass before a feed value is considered stale.
+   * @returns {Promise<[PullFeed, string]>} A promise that resolves to a tuple containing the pull feed instance and the transaction signature.
    */
   async initIx(
     params: {
@@ -246,8 +297,11 @@ export class PullFeed {
     return ix;
   }
 
-  async closeIx(): Promise<TransactionInstruction> {
-    const payerPublicKey = this.program.provider.publicKey!;
+  async closeIx(params: {
+    payer?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const payerPublicKey =
+      params.payer ?? this.program.provider.publicKey ?? PublicKey.default;
     const lutSigner = (
       await PublicKey.findProgramAddress(
         [Buffer.from("LutSigner"), this.pubkey.toBuffer()],
@@ -258,7 +312,7 @@ export class PullFeed {
     const [_, lut] = AddressLookupTableProgram.createLookupTable({
       authority: lutSigner,
       payer: payerPublicKey,
-      recentSlot: data.lutSlot,
+      recentSlot: BigInt(data.lutSlot.toString()),
     });
     const ix = this.program.instruction.pullFeedClose(
       {},
@@ -288,13 +342,12 @@ export class PullFeed {
    * Set configurations for the feed.
    *
    * @param params
-   *        - feedHash: The hash of the feed as a `Uint8Array` or hexadecimal `string`. Only results
-   *          signed with this hash will be accepted.
-   *        - authority: The authority of the feed.
-   *        - maxVariance: The maximum variance allowed for the feed.
-   *        - minResponses: The minimum number of responses required.
-   *        - minSampleSize: The minimum number of samples required for setting feed value
-   *        - maxStaleness: The maximum number of slots that can pass before a feed value is considered stale.
+   * @param params.feedHash - The hash of the feed as a `Uint8Array` or hexadecimal `string`. Only results signed with this hash will be accepted.
+   * @param params.authority - The authority of the feed.
+   * @param params.maxVariance - The maximum variance allowed for the feed.
+   * @param params.minResponses - The minimum number of responses required.
+   * @param params.minSampleSize - The minimum number of samples required for setting feed value.
+   * @param params.maxStaleness - The maximum number of slots that can pass before a feed value is considered stale.
    * @returns A promise that resolves to the transaction instruction to set feed configs.
    */
   async setConfigsIx(params: {
@@ -348,20 +401,20 @@ export class PullFeed {
   /**
    * Fetch updates for the feed.
    *
-   * @param params_
-   *        - gateway: Optionally specify the gateway to use. Else, the gateway is automatically fetched.
-   *        - numSignatures: Number of signatures to fetch.
-   *        - feedConfigs: Optionally specify the feed configs. Else, the feed configs are automatically fetched.
-   *        - jobs: An array of `IOracleJob` representing the jobs to be executed.
-   *        - crossbarClient: Optionally specify the CrossbarClient to use.
-   * @param recentSlothashes - An optional array of recent slothashes as `[anchor.BN, string]` tuples.
-   * @param priceSignatures - An optional array of `FeedEvalResponse` representing the price signatures.
-   * @param debug - A boolean flag to enable or disable debug mode. Defaults to `false`.
-   * @returns A promise that resolves to a tuple containing:
-   *          - The transaction instruction to fetch updates, or `undefined` if not applicable.
-   *          - An array of `OracleResponse` objects.
-   *          - A number representing the successful responses
-   *          - An array containing usable lookup tables
+   * @param {object} params_ - The parameters object.
+   * @param {string} [params_.gateway] - Optionally specify the gateway to use. If not specified, the gateway is automatically fetched.
+   * @param {number} [params_.numSignatures] - Number of signatures to fetch.
+   * @param {FeedRequest} [params_.feedConfigs] - Optionally specify the feed configs. If not specified, the feed configs are automatically fetched.
+   * @param {IOracleJob[]} [params_.jobs] - An array of `IOracleJob` representing the jobs to be executed.
+   * @param {CrossbarClient} [params_.crossbarClient] - Optionally specify the CrossbarClient to use.
+   * @param {Array<[anchor.BN, string]>} [recentSlothashes] - An optional array of recent slothashes as `[anchor.BN, string]` tuples.
+   * @param {FeedEvalResponse[]} [priceSignatures] - An optional array of `FeedEvalResponse` representing the price signatures.
+   * @param {boolean} [debug=false] - A boolean flag to enable or disable debug mode. Defaults to `false`.
+   * @returns {Promise<[TransactionInstruction | undefined, OracleResponse[], number, any[]]>} A promise that resolves to a tuple containing:
+   * - The transaction instruction to fetch updates, or `undefined` if not applicable.
+   * - An array of `OracleResponse` objects.
+   * - A number representing the successful responses.
+   * - An array containing usable lookup tables.
    */
   async fetchUpdateIx(
     params_?: {
@@ -369,26 +422,44 @@ export class PullFeed {
       gateway?: string;
       // Number of signatures to fetch.
       numSignatures?: number;
-      // Optionally specify the feed configs. Else, the feed configs are automatically fetched.
-      feedConfigs?: FeedRequest;
       jobs?: IOracleJob[];
       crossbarClient?: CrossbarClient;
+      retries?: number;
     },
     recentSlothashes?: Array<[anchor.BN, string]>,
     priceSignatures?: FeedEvalResponse[],
     debug: boolean = false
   ): Promise<
-    [TransactionInstruction | undefined, OracleResponse[], number, any[]]
+    [
+      TransactionInstruction | undefined,
+      OracleResponse[],
+      number,
+      any[],
+      string[]
+    ]
   > {
-    const feedConfigs = params_?.feedConfigs ?? (await this.loadConfigs());
+    if (this.configs === null) {
+      this.configs = await this.loadConfigs();
+    }
+    params_ = params_ ?? {};
+    params_.retries = params_.retries ?? 3;
+    const feedConfigs = this.configs;
     const numSignatures =
       params_?.numSignatures ??
-      feedConfigs.minResponses + Math.ceil(feedConfigs.minResponses / 3);
+      feedConfigs.minSampleSize + Math.ceil(feedConfigs.minSampleSize / 3);
     const queueAccount = new Queue(this.program, feedConfigs.queue);
     if (this.gatewayUrl === "") {
       this.gatewayUrl =
         params_?.gateway ??
         (await queueAccount.fetchAllGateways())[0].gatewayUrl;
+    }
+    let jobs = params_?.jobs ?? this.jobs;
+    if (!jobs?.length) {
+      const data = await this.loadData();
+      jobs = await (params_?.crossbarClient ?? CrossbarClient.default())
+        .fetch(Buffer.from(data.feedHash).toString("hex"))
+        .then((resp) => resp.jobs);
+      this.jobs = jobs;
     }
     const params = {
       feed: this.pubkey,
@@ -396,15 +467,24 @@ export class PullFeed {
       ...feedConfigs,
       ...params_,
       numSignatures,
+      jobs: jobs,
     };
-    const ix = await PullFeed.fetchUpdateIx(
-      this.program,
-      params,
-      recentSlothashes,
-      priceSignatures,
-      debug
-    );
-    return ix;
+    let err = null;
+    for (let i = 0; i < params.retries; i++) {
+      try {
+        const ix = await PullFeed.fetchUpdateIx(
+          this.program,
+          params,
+          recentSlothashes,
+          priceSignatures,
+          debug
+        );
+        return ix;
+      } catch (err_: any) {
+        err = err_;
+      }
+    }
+    throw err;
   }
 
   /**
@@ -412,35 +492,42 @@ export class PullFeed {
    * @returns A promise that resolves to the feed configurations.
    * @throws if the feed account does not exist.
    */
-  async loadConfigs(): Promise<any> {
+  async loadConfigs(): Promise<{
+    queue: PublicKey;
+    maxVariance: number;
+    minResponses: number;
+    feedHash: Buffer;
+    minSampleSize: number;
+  }> {
     const data = await this.loadData();
-    const maxVariance = data.maxVariance / 1e9;
+    const maxVariance = data.maxVariance.toNumber() / 1e9;
     return {
       queue: data.queue,
       maxVariance: maxVariance,
       minResponses: data.minResponses,
       feedHash: data.feedHash,
-      ipfsHash: data.ipfsHash,
+      minSampleSize: data.minSampleSize,
     };
   }
 
   /**
    * Fetch updates for the feed.
    *
-   * @param params_
-   *        - gateway: Optionally specify the gateway to use. Else, the gateway is automatically fetched.
-   *        - numSignatures: Number of signatures to fetch.
-   *        - feedConfigs: Optionally specify the feed configs. Else, the feed configs are automatically fetched.
-   *        - jobs: An array of `IOracleJob` representing the jobs to be executed.
-   *        - crossbarClient: Optionally specify the CrossbarClient to use.
+   * @param params_ - The parameters object.
+   * @param params_.gateway - Optionally specify the gateway to use. If not specified, the gateway is automatically fetched.
+   * @param params_.numSignatures - Number of signatures to fetch.
+   * @param params_.feedConfigs - Optionally specify the feed configs. If not specified, the feed configs are automatically fetched.
+   * @param params_.jobs - An array of `IOracleJob` representing the jobs to be executed.
+   * @param params_.crossbarClient - Optionally specify the CrossbarClient to use.
    * @param recentSlothashes - An optional array of recent slothashes as `[anchor.BN, string]` tuples.
    * @param priceSignatures - An optional array of `FeedEvalResponse` representing the price signatures.
    * @param debug - A boolean flag to enable or disable debug mode. Defaults to `false`.
+   * @param payer - Optionally specify the payer public key.
    * @returns A promise that resolves to a tuple containing:
-   *          - The transaction instruction to fetch updates, or `undefined` if not applicable.
-   *          - An array of `OracleResponse` objects.
-   *          - A number representing the successful responses
-   *          - An array containing usable lookup tables
+   * - The transaction instruction to fetch updates, or `undefined` if not applicable.
+   * - An array of `OracleResponse` objects.
+   * - A number representing the successful responses.
+   * - An array containing usable lookup tables.
    */
   static async fetchUpdateIx(
     program: Program,
@@ -451,7 +538,7 @@ export class PullFeed {
       numSignatures: number;
       maxVariance: number;
       minResponses: number;
-      jobs?: IOracleJob[];
+      jobs: IOracleJob[];
       crossbarClient?: CrossbarClient;
     },
     recentSlothashes?: Array<[anchor.BN, string]>,
@@ -459,28 +546,37 @@ export class PullFeed {
     debug: boolean = false,
     payer?: PublicKey
   ): Promise<
-    [TransactionInstruction | undefined, OracleResponse[], number, any[]]
+    [
+      TransactionInstruction | undefined,
+      OracleResponse[],
+      number,
+      any[],
+      string[]
+    ]
   > {
-    const slotHashes =
-      recentSlothashes ??
-      (await RecentSlotHashes.fetchLatestNSlothashes(
+    let slotHashes = recentSlothashes;
+    if (slotHashes === undefined) {
+      slotHashes = await RecentSlotHashes.fetchLatestNSlothashes(
         program.provider.connection,
         30
-      ));
-    const feed = new PullFeed(program, params_.feed);
-    const params = params_ as any;
-    if (!params_.jobs?.length) {
-      const data = await feed.loadData();
-      params.jobs = await (params_.crossbarClient ?? CrossbarClient.default())
-        .fetch(Buffer.from(data.feedHash).toString("hex"))
-        .then((resp) => resp.jobs);
+      );
     }
-    params.recentHash = slotHashes[0][1];
-    priceSignatures =
-      priceSignatures ?? (await Queue.fetchSignatures(program, params));
+    const feed = new PullFeed(program, params_.feed);
+    const params = params_;
+    const jobs = params.jobs;
+    let failures_: string[] = [];
+    if (priceSignatures === undefined || priceSignatures === null) {
+      const { responses, failures } = await Queue.fetchSignatures(program, {
+        ...params,
+        jobs: jobs!.map((x) => OracleJob.create(x)),
+        recentHash: slotHashes[0][1],
+      });
+      priceSignatures = responses;
+      failures_ = failures;
+    }
     let numSuccesses = 0;
     if (!priceSignatures) {
-      return [undefined, [], 0, []];
+      return [undefined, [], 0, [], []];
     }
     const oracleResponses = priceSignatures.map((x) => {
       const oldDP = Big.DP;
@@ -540,25 +636,25 @@ export class PullFeed {
         `PullFeed.fetchUpdateIx Failure: ${oracleResponses.map((x) => x.error)}`
       );
     }
-    return [submitSignaturesIx, oracleResponses, numSuccesses, luts];
+    return [submitSignaturesIx, oracleResponses, numSuccesses, luts, failures_];
   }
 
   /**
    * Fetches updates for multiple feeds at once.
    *
-   * @param program The Anchor program instance.
-   * @param params_
-   *        - gateway: The gateway URL to use. If not provided, the gateway is automatically fetched.
-   *        - feeds: An array of feed account public keys.
-   *        - numSignatures: The number of signatures to fetch.
-   *        - crossbarClient: Optionally specify the CrossbarClient to use.
+   * @param program - The Anchor program instance.
+   * @param params_ - The parameters object.
+   * @param params_.gateway - The gateway URL to use. If not provided, the gateway is automatically fetched.
+   * @param params_.feeds - An array of feed account public keys.
+   * @param params_.numSignatures - The number of signatures to fetch.
+   * @param params_.crossbarClient - Optionally specify the CrossbarClient to use.
    * @param recentSlothashes - An optional array of recent slothashes as `[anchor.BN, string]` tuples.
    * @param debug - A boolean flag to enable or disable debug mode. Defaults to `false`.
    * @param payer - Optionally specify the payer public key.
    * @returns A promise that resolves to a tuple containing:
-   *          - The transaction instruction for fetching updates.
-   *          - An array of `AddressLookupTableAccount` to use.
-   *          - The raw response data.
+   * - The transaction instruction for fetching updates.
+   * - An array of `AddressLookupTableAccount` to use.
+   * - The raw response data.
    */
   static async fetchUpdateManyIx(
     program: Program,
@@ -567,6 +663,7 @@ export class PullFeed {
       feeds: PublicKey[];
       numSignatures: number;
       crossbarClient?: CrossbarClient;
+      payer?: PublicKey;
     },
     recentSlothashes?: Array<[anchor.BN, string]>,
     debug: boolean = false,
@@ -579,8 +676,12 @@ export class PullFeed {
         30
       ));
     const feeds = params_.feeds.map((feed) => new PullFeed(program, feed));
-    const params = params_ as any;
-    const feedConfigs: any = [];
+    const params = params_;
+    const feedConfigs: {
+      maxVariance: number;
+      minResponses: number;
+      jobs: any;
+    }[] = [];
     let queue: PublicKey | undefined = undefined;
     for (const feed of feeds) {
       const data = await feed.loadData();
@@ -590,7 +691,7 @@ export class PullFeed {
         );
       }
       queue = data.queue;
-      const maxVariance = data.maxVariance / 1e9;
+      const maxVariance = data.maxVariance.toNumber() / 1e9;
       const minResponses = data.minResponses;
       const jobs = await (params_.crossbarClient ?? CrossbarClient.default())
         .fetch(Buffer.from(data.feedHash).toString("hex"))
@@ -601,10 +702,12 @@ export class PullFeed {
         jobs,
       });
     }
-    params.recentHash = slotHashes[0][1];
-    params.feedConfigs = feedConfigs;
-    params.queue = queue!;
-    const response = await Queue.fetchSignaturesMulti(program, params);
+    const response = await Queue.fetchSignaturesMulti(program, {
+      ...params,
+      recentHash: slotHashes[0][1],
+      feedConfigs,
+      queue: queue!,
+    });
     const numResponses = response.oracle_responses.length;
     const oracles: PublicKey[] = [];
     const submissions: any[] = [];
@@ -783,7 +886,7 @@ export class PullFeed {
    *  @returns A promise that resolves to the feed data.
    *  @throws if the feed account does not exist.
    */
-  async loadData(): Promise<any> {
+  async loadData(): Promise<PullFeedAccountData> {
     return await this.program.account["pullFeedAccountData"].fetch(this.pubkey);
   }
 
@@ -803,8 +906,8 @@ export class PullFeed {
         Big.DP = 40;
         return {
           value: new Big(x.value.toString()).div(1e18),
-          slot: new Big(x.slot.toString()),
-          oracle: x.oracle,
+          slot: new BN(x.slot.toString()),
+          oracle: new PublicKey(x.oracle),
         };
       });
   }
@@ -923,11 +1026,15 @@ export class PullFeed {
   }
 
   async loadLookupTable(): Promise<AddressLookupTableAccount> {
+    if (this.lut !== null && this.lut !== undefined) {
+      return this.lut;
+    }
     const data = await this.loadData();
     const lutKey = this.lookupTableKey(data);
     const accnt = await this.program.provider.connection.getAddressLookupTable(
       lutKey
     );
-    return accnt.value!;
+    this.lut = accnt.value!;
+    return this.lut!;
   }
 }

@@ -16,8 +16,10 @@ import {
 import {
   createAttestationHexString,
   createUpdateHexString,
-  createUpsertHexString,
+  createV0AttestationHexString,
 } from "./message.js";
+
+import NodeWallet from "@coral-xyz/anchor-30/dist/cjs/nodewallet.js";
 export * as message from "./message.js";
 import * as anchor from "@coral-xyz/anchor-30";
 import { Big, OracleJob } from "@switchboard-xyz/common";
@@ -139,13 +141,15 @@ export async function simulateFeed(
   queue: Queue
 ): Promise<FeedSimulateResult> {
   const gateway = params.gateway ?? (await queue.fetchGateway());
-  const [result] = await gateway.fetchSignatures({
-    ...params,
-    useTimestamp: true,
-    recentHash: bs58.encode(
-      Buffer.from(params.recentHash ?? "0".repeat(64), "hex")
-    ),
-  });
+  const result = (
+    await gateway.fetchSignatures({
+      ...params,
+      useTimestamp: true,
+      recentHash: bs58.encode(
+        Buffer.from(params.recentHash ?? "0".repeat(64), "hex")
+      ),
+    })
+  ).responses[0];
 
   return {
     result: new Big(result.success_value).div(new Big(10).pow(18)).toNumber(),
@@ -189,97 +193,17 @@ export async function getFeedUpdateWithContext(
   }
 
   // Get the Feed Update if the feed exists
-  if (params.aggregatorId) {
-    updates.push(
-      ...(await getUpdate(
-        {
-          ...params,
-          recentHash: blockhash,
-        },
-        queue
-      ))
-    );
-  }
-  // Otherwise, get the Feed Upsert
-  else {
-    updates.push(
-      ...(await getUpsert(
-        {
-          ...params,
-          recentHash: blockhash,
-        },
-        queue
-      ))
-    );
-  }
+  updates.push(
+    ...(await getUpdate(
+      {
+        ...params,
+        recentHash: blockhash,
+      },
+      queue
+    ))
+  );
 
   return updates;
-}
-
-/**
- * Get the upsert message for the EVM for a particular feed
- * Upserts are necessary when creating a new feed on a target chain
- * @param params - FeedUpdateCommonOptions: Parameters for the upsert message
- * @param queue - Queue: The queue account
- * @returns - Promise<string> - The upsert gmessage as a hex string
- */
-export async function getUpsert(
-  params: FeedUpdateCommonOptions,
-  queue: Queue
-): Promise<FeedUpdateResult[]> {
-  if (!params.recentHash) {
-    params.recentHash = "0".repeat(64);
-  }
-  if (params.recentHash.startsWith("0x")) {
-    params.recentHash = params.recentHash.slice(2);
-  }
-
-  const gateway = params.gateway ?? (await queue.fetchGateway());
-
-  const results = await gateway.fetchSignatures({
-    ...params,
-    useTimestamp: true,
-    recentHash: bs58.encode(Buffer.from(params.recentHash, "hex")),
-  });
-
-  const responses: FeedUpdateResult[] = [];
-
-  for (const result of results) {
-    const signatureBuffer = new Uint8Array(
-      Buffer.from(result.signature, "base64")
-    );
-    const r = Buffer.from(signatureBuffer.slice(0, 32)).toString("hex");
-    const s = Buffer.from(signatureBuffer.slice(32, 64)).toString("hex");
-    const v = result.recovery_id;
-
-    // Create the upsert message
-    const hex = createUpsertHexString({
-      discriminator: 0,
-      feedId: result.feed_hash.toString(),
-      queue: Buffer.from(queue.pubkey.toBytes()).toString("hex"),
-      result: result.success_value.toString(),
-      maxVariance: ((params.maxVariance ?? 1) * 1e9).toString(),
-      minResponses: (params.minResponses ?? 1).toString(),
-      blockNumber: params.blockNumber?.toString() ?? "0",
-      timestamp: result.timestamp?.toString(),
-      r,
-      s,
-      v,
-    });
-
-    const res = {
-      feedId: result.feed_hash,
-      result: new Big(result.success_value).div(new Big(10).pow(18)).toNumber(),
-      encoded: hex,
-      response: result,
-    };
-
-    // Add the response to the array
-    responses.push(res);
-  }
-
-  // Return the responses
-  return responses;
 }
 
 /**
@@ -311,7 +235,7 @@ export async function getUpdate(
   });
   const response: FeedUpdateResult[] = [];
 
-  for (const result of results) {
+  for (const result of results.responses) {
     // Decode from Base64 to a Buffer
     const signatureBuffer = new Uint8Array(
       Buffer.from(result.signature, "base64")
@@ -388,26 +312,53 @@ export async function getAttestation(
   const s = Buffer.from(signatureBuffer.slice(32, 64)).toString("hex");
   const v = attestation.recovery_id;
 
-  const hexString = createAttestationHexString({
-    discriminator: 2,
-    oracleId,
-    queueId,
-    ed25519Key: attestation.oracle_ed25519_enclave_signer,
-    secp256k1Key: attestation.oracle_secp256k1_enclave_signer,
-    r,
-    s,
-    v,
-    mrEnclave: attestation.mr_enclave,
-    blockNumber: blockNumber.toString(),
-  });
+  // Create the attestation bassed on message contents (it'll either be v0 or ordinary)
+  if (attestation.oracle_ed25519_enclave_signer) {
+    const hexString = createV0AttestationHexString({
+      discriminator: 2,
+      oracleId,
+      queueId,
+      ed25519Key: attestation.oracle_ed25519_enclave_signer,
+      secp256k1Key: attestation.oracle_secp256k1_enclave_signer,
+      r,
+      s,
+      v,
+      mrEnclave: attestation.mr_enclave,
+      blockNumber: blockNumber.toString(),
+    });
 
-  return {
-    oracleId: attestation.oracle,
-    queueId: attestation.queue,
-    guardian: attestation.guardian,
-    encoded: hexString,
-    response: attestation,
-  };
+    return {
+      oracleId,
+      queueId,
+      guardian: attestation.guardian,
+      encoded: hexString,
+      response: attestation,
+    };
+  } else if (attestation.timestamp) {
+    const hexString = createAttestationHexString({
+      discriminator: 2,
+      oracleId,
+      queueId,
+      secp256k1Key: attestation.oracle_secp256k1_enclave_signer,
+      timestamp: attestation.timestamp.toString(),
+      mrEnclave: attestation.mr_enclave,
+      r,
+      s,
+      v,
+      blockNumber: blockNumber.toString(),
+      guardianId: attestation.guardian,
+    });
+
+    return {
+      oracleId: attestation.oracle,
+      queueId: attestation.queue,
+      guardian: attestation.guardian,
+      encoded: hexString,
+      response: attestation,
+    };
+  } else {
+    throw new Error("Invalid attestation response");
+  }
 }
 
 /**
@@ -485,7 +436,7 @@ export async function getQueue(
   queueAddress: string
 ): Promise<Queue> {
   const { PublicKey, Keypair, Connection } = anchor.web3;
-  const wallet: anchor.Wallet = new anchor.Wallet(new Keypair());
+  const wallet: NodeWallet = new NodeWallet(new Keypair());
   const connection = new Connection(solanaRPCUrl, "confirmed");
   const PID = new PublicKey(switchboardProgramId);
   const queue = new PublicKey(queueAddress);

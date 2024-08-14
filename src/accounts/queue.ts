@@ -243,7 +243,7 @@ export class Queue {
       maxVariance?: number;
       minResponses?: number;
     }
-  ): Promise<FeedEvalResponse[]> {
+  ): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     const queueAccount = new Queue(program, params.queue);
     return queueAccount.fetchSignatures(params);
   }
@@ -382,7 +382,7 @@ export class Queue {
     numSignatures?: number;
     maxVariance?: number;
     minResponses?: number;
-  }): Promise<FeedEvalResponse[]> {
+  }): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     let gateway = new Gateway(this.program, params.gateway ?? "");
     if (params.gateway === undefined) {
       gateway = await this.fetchGateway();

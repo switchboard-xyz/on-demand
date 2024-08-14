@@ -1,0 +1,1 @@
+{"version":3,"file":"index.d.ts","sourceRoot":"","sources":["../../../../src/event-utils/index.ts"],"names":[],"mappings":"AAaA,qBAAa,kBAAkB;aACD,GAAG,EAAE,GAAG;gBAAR,GAAG,EAAE,GAAG;IACpC,MAAM,IAAI,KAAK,CAAC;QAAE,IAAI,EAAE,MAAM,CAAC;QAAC,MAAM,EAAE,MAAM,CAAC;QAAC,KAAK,EAAE,MAAM,GAAG,IAAI,CAAA;KAAE,CAAC;CA2BxE"}

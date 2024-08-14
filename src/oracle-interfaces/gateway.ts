@@ -8,6 +8,7 @@ import axios from "axios";
 import * as bs58 from "bs58";
 import { Agent as HttpsAgent } from "https";
 import NodeCache from "node-cache";
+import type { AxiosInstance } from "axios";
 
 const GATEWAY_PING_CACHE = new NodeCache({ stdTTL: 100, checkperiod: 120 });
 
@@ -21,14 +22,20 @@ function newAbortSignal(timeoutMs: number): AbortSignal {
 const httpsAgent = new HttpsAgent({
   rejectUnauthorized: false, // WARNING: This disables SSL/TLS certificate verification.
 });
-const timeout = 10_000;
+const TIMEOUT = 10_000;
 
-function axiosClient() {
-  return axios.create({
-    httpsAgent,
-    signal: newAbortSignal(timeout),
-  });
-}
+const axiosClient: () => AxiosInstance = (() => {
+  let instance;
+
+  return () => {
+    if (!instance) {
+      instance = axios.create({
+        httpsAgent,
+      });
+    }
+    return instance;
+  };
+})();
 
 /**
  *  The response from the gateway after fetching signatures.
@@ -256,11 +263,6 @@ export interface BridgeEnclaveResponse {
   chain_hash: string;
 
   /**
-   * The ed25519 enclave signer for the oracle (used for solana transactions)
-   */
-  oracle_ed25519_enclave_signer: string;
-
-  /**
    * The secp256k1 enclave signer for the oracle
    */
   oracle_secp256k1_enclave_signer: string;
@@ -274,6 +276,16 @@ export interface BridgeEnclaveResponse {
    * (UNUSED) The attestation message before being hashed
    */
   msg_prehash: string;
+
+  /**
+   * The ed25519 enclave signer for the oracle
+   */
+  oracle_ed25519_enclave_signer?: string;
+
+  /**
+   * The timestamp of the attestation
+   */
+  timestamp?: number;
 
   /**
    * The signature from the guardian
@@ -325,13 +337,12 @@ export class Gateway {
     maxVariance: number;
     minResponses: number;
     useTimestamp?: boolean;
-  }): Promise<FeedEvalResponse[]> {
+  }): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     // TODO: have total NumOracles count against rate limit per IP
     const { recentHash, encodedJobs, numSignatures } = params;
     const url = `${this.gatewayUrl}/gateway/api/v1/fetch_signatures`;
-    const method = "POST";
     const headers = { "Content-Type": "application/json" };
-    const maxVariance = Math.floor((params.maxVariance ?? 1) * 1e9);
+    const maxVariance = params.maxVariance * 1e9;
     const body = JSON.stringify({
       api_version: "1.0.0",
       jobs_b64_encoded: encodedJobs,
@@ -343,9 +354,12 @@ export class Gateway {
       min_responses: params.minResponses,
       use_timestamp: params.useTimestamp ?? false,
     });
-    return axiosClient()(url, { method, headers, data: body })
-      .then((r) => r.data)
-      .then((r: any) => r.responses);
+    return axiosClient()
+      .post(url, body, {
+        headers,
+        timeout: TIMEOUT,
+      })
+      .then((r) => r.data);
   }
 
   async ping(): Promise<PingResponse> {
@@ -353,7 +367,9 @@ export class Gateway {
     const method = "POST";
     const headers = { "Content-Type": "application/json" };
     const body = JSON.stringify({ api_version: "1.0.0" });
-    return fetch(url, { method, headers, body }).then((r) => r.json());
+    return axiosClient()
+      .post(url, body, { method, headers, timeout: TIMEOUT })
+      .then((r) => r.data);
   }
 
   /**
@@ -394,7 +410,9 @@ export class Gateway {
       chain_hash: params.recentHash,
     });
 
-    return fetch(url, { method, headers, body }).then((r) => r.json());
+    return axiosClient()
+      .post(url, { method, headers, data: body, timeout: TIMEOUT })
+      .then((r) => r.data);
   }
 
   /**
@@ -424,9 +442,11 @@ export class Gateway {
       get_for_oracle: params.get_for_oracle,
       get_for_guardian: params.get_for_guardian,
     });
-    return fetch(url, { method, headers, body }).then(async (r) => {
-      return r.json();
-    });
+    return axiosClient()
+      .post(url, { method, headers, data: body, timeout: TIMEOUT })
+      .then(async (r) => {
+        return r.data;
+      });
   }
 
   /**
@@ -455,12 +475,11 @@ export class Gateway {
       oracle_pubkey: params.oraclePubkey,
       queue_pubkey: params.queuePubkey,
     });
-    return fetch(url, { method, headers, body }).then(async (r) => {
-      if (!r.ok) {
-        throw new Error(`Request failed with status ${r.status}`);
-      }
-      return r.json();
-    });
+    return axiosClient()
+      .post(url, body, { method, headers, timeout: TIMEOUT })
+      .then((r) => {
+        return r.data;
+      });
   }
 
   // alberthermida@Switchboard ts % curl -X POST \
@@ -494,7 +513,7 @@ export class Gateway {
     maxVariance?: number;
     minResponses?: number;
     useTimestamp?: boolean;
-  }): Promise<FeedEvalResponse[]> {
+  }): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     params.numSignatures = params.numSignatures ?? 1;
     params.maxVariance = params.maxVariance ?? 1;
     params.minResponses = params.minResponses ?? 1;
@@ -557,7 +576,6 @@ export class Gateway {
     const url = `${this.gatewayUrl}/gateway/api/v1/fetch_signatures_multi`;
     const method = "POST";
     const headers = { "Content-Type": "application/json" };
-    const requests: any = [];
     const body = {
       api_version: "1.0.0",
       num_oracles: numSignatures,
@@ -567,7 +585,7 @@ export class Gateway {
       feed_requests: [] as any,
     };
     for (const config of encodedConfigs) {
-      const maxVariance = Math.floor((config.maxVariance ?? 1) * 1e9);
+      const maxVariance = Math.floor(Number(config.maxVariance ?? 1) * 1e9);
       body.feed_requests.push({
         jobs_b64_encoded: config.encodedJobs,
         max_variance: maxVariance,

@@ -1,28 +1,16 @@
 {
   "name": "@switchboard-xyz/on-demand",
-  "version": "1.1.39",
+  "version": "1.2.22",
   "description": "A Typescript client to interact with Switchboard On-Demand.",
   "license": "ISC",
-  "type": "module",
-  "exports": {
-    ".": {
-      "types": "./index.d.ts",
-      "import": "./index.js",
-      "require": "./index.cjs"
-    },
-    "./package.json": "./package.json"
-  },
-  "main": "./index.js",
-  "types": "./index.d.ts",
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/types/esm/index.d.ts",
   "files": [
-    "dist/",
-    "package.json",
-    "index.cjs",
-    "index.js",
-    "index.d.ts"
+    "dist"
   ],
   "scripts": {
-    "build": "node esbuild.js",
+    "build": "tsc && tsc --project tsconfig.cjs.json",
     "check-types": "tsc --noEmit",
     "docgen": "typedoc --out ./docs/ ./src",
     "docgen:deploy": "pnpm docgen && firebase deploy --project docs --only hosting:switchboard-docs",

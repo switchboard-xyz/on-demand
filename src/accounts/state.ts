@@ -13,10 +13,10 @@ export class State {
   public pubkey: PublicKey;
 
   /**
-   *  Derives a state PDA (Program Derived Address) from the program.
+   * Derives a state PDA (Program Derived Address) from the program.
    *
-   *  @param program The Anchor program instance.
-   *  @returns A promise that resolves to the derived state account's public key.
+   * @param {Program} program - The Anchor program instance.
+   * @returns {PublicKey} The derived state account's public key.
    */
   static keyFromSeed(program: Program): PublicKey {
     const [state] = PublicKey.findProgramAddressSync(
@@ -27,10 +27,10 @@ export class State {
   }
 
   /**
-   *  Initializes the state account.
+   * Initializes the state account.
    *
-   *  @param program The Anchor program instance.
-   *  @returns A promise that resolves to the state account and the transaction signature.
+   * @param {Program} program - The Anchor program instance.
+   * @returns {Promise<[State, string]>} A promise that resolves to the state account and the transaction signature.
    */
   static async create(program: Program): Promise<[State, String]> {
     const payer = (program.provider as any).wallet.payer;
@@ -50,9 +50,9 @@ export class State {
   }
 
   /**
-   *  Constructs a `State` instance.
+   * Constructs a `State` instance.
    *
-   *  @param program The Anchor program instance.
+   * @param {Program} program - The Anchor program instance.
    */
   constructor(readonly program: Program) {
     const pubkey = State.keyFromSeed(program);
@@ -60,10 +60,22 @@ export class State {
   }
 
   /**
-   * Set program wide configurations.
-   * @param params.guardianQueue The guardian queue account.
-   * @param params.newAuthority The new authority account.
-   * @param params.minQuoteVerifyVotes The minimum number of votes required to verify a quote.
+   * Set program-wide configurations.
+   *
+   * @param {object} params - The configuration parameters.
+   * @param {PublicKey} [params.guardianQueue] - The guardian queue account.
+   * @param {PublicKey} [params.newAuthority] - The new authority account.
+   * @param {BN} [params.minQuoteVerifyVotes] - The minimum number of votes required to verify a quote.
+   * @param {PublicKey} [params.stakeProgram] - The stake program account.
+   * @param {PublicKey} [params.stakePool] - The stake pool account.
+   * @param {number} [params.permitAdvisory] - The permit advisory value.
+   * @param {number} [params.denyAdvisory] - The deny advisory value.
+   * @param {boolean} [params.testOnlyDisableMrEnclaveCheck] - A flag to disable MrEnclave check for testing purposes.
+   * @param {PublicKey} [params.switchMint] - The switch mint account.
+   * @param {BN} [params.epochLength] - The epoch length.
+   * @param {boolean} [params.resetEpochs] - A flag to reset epochs.
+   * @param {boolean} [params.enableStaking] - A flag to enable staking.
+   * @returns {Promise<TransactionInstruction>} A promise that resolves to the transaction instruction.
    */
   async setConfigsIx(params: {
     guardianQueue?: PublicKey;
@@ -117,8 +129,10 @@ export class State {
 
   /**
    * Register a guardian with the global guardian queue.
-   * @param params.guardian The guardian account.
-   * @returns A promise that resolves to the transaction instruction
+   *
+   * @param {object} params - The parameters object.
+   * @param {PublicKey} params.guardian - The guardian account.
+   * @returns {Promise<TransactionInstruction>} A promise that resolves to the transaction instruction.
    */
   async registerGuardianIx(params: {
     guardian: PublicKey;
@@ -143,8 +157,10 @@ export class State {
 
   /**
    * Unregister a guardian from the global guardian queue.
-   * @param params.guardian The guardian account.
-   * @returns A promise that resolves to the transaction instruction
+   *
+   * @param {object} params - The parameters object.
+   * @param {PublicKey} params.guardian - The guardian account.
+   * @returns {Promise<TransactionInstruction>} A promise that resolves to the transaction instruction.
    */
   async unregisterGuardianIx(params: {
     guardian: PublicKey;

@@ -4,22 +4,40 @@ import type { PullFeed } from "../accounts/pullFeed.js";
 import { Queue } from "../accounts/queue.js";
 
 import * as anchor from "@coral-xyz/anchor-30";
+import NodeWallet from "@coral-xyz/anchor-30/dist/cjs/nodewallet.js";
 import type { AddressLookupTableAccount } from "@solana/web3.js";
 import { PublicKey } from "@solana/web3.js";
 import type { IOracleJob } from "@switchboard-xyz/common";
 import { CrossbarClient } from "@switchboard-xyz/common";
 
-export async function loadLookupTables(
-  accounts: any[]
-): Promise<AddressLookupTableAccount[]> {
-  const out: Promise<any>[] = [];
-  for (const account of accounts) {
-    if (account.loadLookupTable) {
-      out.push(account.loadLookupTable());
+type Account = {
+  pubkey: PublicKey;
+  loadLookupTable: () => Promise<AddressLookupTableAccount>;
+};
+
+export function createLoadLookupTables() {
+  const promiseMap: Map<string, Promise<AddressLookupTableAccount>> = new Map();
+
+  async function loadLookupTables(
+    accounts: Account[]
+  ): Promise<AddressLookupTableAccount[]> {
+    for (const account of accounts) {
+      const pubkey = account.pubkey.toString();
+      if (pubkey && account.loadLookupTable) {
+        if (!promiseMap.has(pubkey)) {
+          promiseMap.set(pubkey, account.loadLookupTable());
+        }
+      }
     }
+
+    const out = Array.from(promiseMap.values());
+    return Promise.all(out);
   }
-  return Promise.all(out);
+
+  return loadLookupTables;
 }
+
+export const loadLookupTables = createLoadLookupTables();
 
 // Mainnet ID's
 export const ON_DEMAND_MAINNET_PID =
@@ -112,7 +130,7 @@ export async function getQueue(
   queueAddress: string
 ): Promise<Queue> {
   const { PublicKey, Keypair, Connection } = anchor.web3;
-  const wallet: anchor.Wallet = new anchor.Wallet(new Keypair());
+  const wallet: NodeWallet = new NodeWallet(new Keypair());
   const connection = new Connection(solanaRPCUrl, "confirmed");
   const PID = new PublicKey(switchboardProgramId);
   const queue = new PublicKey(queueAddress);

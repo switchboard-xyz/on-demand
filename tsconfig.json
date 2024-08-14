@@ -1,25 +1,29 @@
 {
-  "extends": "./tsconfig.base.json",
-  "exclude": [
-    "node_modules",
-    "**/test/**/*.ts",
-    "lib"
-  ],
   "compilerOptions": {
-    "module": "NodeNext",
-    "target": "es2022",
+    "target": "ES6",
+    "module": "ES6",
+    "outDir": "./dist/esm",
+    "rootDir": "./src",
+    "noImplicitAny": false,
     "strict": true,
-    "lib": [
-      "ES2021",
-      "ES2022.Object",
-      "DOM"
-    ],
-    "outDir": "lib",
-    "rootDir": "./src"
+    "esModuleInterop": true,
+    "declaration": true,
+    "declarationDir": "./dist/types/esm",
+    "declarationMap": true,
+    "moduleResolution": "node",
+    "baseUrl": "./",
+    "paths": {
+      "@coral-xyz/anchor-30": ["node_modules/@coral-xyz/anchor-30"],
+      "@solana/web3.js": ["node_modules/@solana/web3.js"]
+    },
+    "typeRoots": ["./node_modules/@types", "./types"],
+    "skipLibCheck": true,
+    "strictNullChecks": false,
+    "strictPropertyInitialization": false,
+    "sourceMap": true,
+    "inlineSources": true
   },
-  "typedocOptions": {
-    "entryPoints": [
-      "src/index.ts"
-    ]
-  }
+  "include": ["src"],
+  "exclude": ["node_modules"]
 }
+

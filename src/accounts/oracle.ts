@@ -20,7 +20,11 @@ import {
  *  This class represents an oracle account on chain.
  */
 export class Oracle {
-  constructor(readonly program: Program, readonly pubkey: PublicKey) {}
+  lut: AddressLookupTableAccount | null;
+
+  constructor(readonly program: Program, readonly pubkey: PublicKey) {
+    this.lut = null;
+  }
 
   /**
    * Creates a new oracle account. linked to the specified queue.
@@ -69,6 +73,16 @@ export class Oracle {
       payer: payer.publicKey,
       recentSlot,
     });
+    const [delegationGroup] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Group"),
+        stateKey.toBuffer(),
+        state.stakePool.toBuffer(),
+        params.queue.toBuffer(),
+      ],
+      state.stakeProgram
+    );
+
     const ix = await program.instruction.oracleInit(
       {
         recentSlot: new BN(recentSlot.toString()),
@@ -113,7 +127,7 @@ export class Oracle {
           oracle: oracle.publicKey,
           oracleStats,
           queue: params.queue,
-          authority: stateKey,
+          authority: payer.publicKey,
           programState: stateKey,
           payer: payer.publicKey,
           systemProgram: SystemProgram.programId,
@@ -142,6 +156,7 @@ export class Oracle {
           )[0],
           stakeProgram: state.stakeProgram,
           stakePool: state.stakePool,
+          delegationGroup,
         },
       }
     );
@@ -151,6 +166,7 @@ export class Oracle {
   async updateDelegationRewardPoolsIx(params: {
     overrideStakePool?: PublicKey;
     overrideMint?: PublicKey;
+    authority: PublicKey;
   }): Promise<TransactionInstruction> {
     const program = this.program;
     const stateKey = State.keyFromSeed(program);
@@ -196,7 +212,7 @@ export class Oracle {
           oracle: this.pubkey,
           oracleStats,
           queue: oracleData.queue,
-          authority: stateKey,
+          authority: params.authority,
           programState: stateKey,
           payer: payer.publicKey,
           systemProgram: SystemProgram.programId,
@@ -260,6 +276,12 @@ export class Oracle {
     return await this.program.account["oracleAccountData"].fetch(this.pubkey);
   }
 
+  async fetchGateway(): Promise<string> {
+    const data = await this.loadData();
+    const gw = Buffer.from(data.gatewayUri).toString();
+    return gw.replace(/\0+$/, "");
+  }
+
   /**
    * Loads the oracle data for a list of {@linkcode Oracle} accounts from on chain.
    *
@@ -292,8 +314,20 @@ export class Oracle {
     return [status === 4 && now < expiration, expiration.toNumber()];
   }
 
+  /**
+   * Get the pubkey of the stats account for this oracle.
+   * @returns A promise that resolves to the pubkey of the stats account.
+   */
+  async statsKey(): Promise<PublicKey> {
+    return (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("OracleStats"), this.pubkey.toBuffer()],
+        this.program.programId
+      )
+    )[0];
+  }
+
   async lutKey(): Promise<PublicKey> {
-    const payer = (this.program.provider as any).wallet.payer;
     const data = await this.loadData();
     const lutSigner = (
       await PublicKey.findProgramAddress(
@@ -303,7 +337,7 @@ export class Oracle {
     )[0];
     const [_, lutKey] = await AddressLookupTableProgram.createLookupTable({
       authority: lutSigner,
-      payer: payer.publicKey,
+      payer: PublicKey.default,
       recentSlot: data.lutSlot,
     });
     return lutKey;
@@ -323,10 +357,14 @@ export class Oracle {
   }
 
   async loadLookupTable(): Promise<AddressLookupTableAccount> {
+    if (this.lut !== null && this.lut !== undefined) {
+      return this.lut;
+    }
     const lutKey = await this.lutKey();
     const accnt = await this.program.provider.connection.getAddressLookupTable(
       lutKey
     );
-    return accnt.value!;
+    this.lut = accnt.value!;
+    return this.lut!;
   }
 }

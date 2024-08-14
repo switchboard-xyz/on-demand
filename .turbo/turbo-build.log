@@ -1,5 +1,7 @@
 
-> @switchboard-xyz/on-demand@1.0.16 build /Users/mgild/projects/sbv3/javascript/on-demand
+> @switchboard-xyz/on-demand@1.1.24 build /Users/mgild/projects/sbv3/javascript/on-demand
 > node esbuild.js
 
+(node:16062) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
 Generating entrypoints ...

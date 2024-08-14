@@ -1,6 +1,7 @@
 import { SB_ON_DEMAND_PID } from "./../constants.js";
 
 import * as anchor from "@coral-xyz/anchor-30";
+import NodeWallet from "@coral-xyz/anchor-30/dist/cjs/nodewallet.js";
 import type { Commitment } from "@solana/web3.js";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import * as fs from "fs";
@@ -16,7 +17,7 @@ type SolanaConfig = {
   keypair: Keypair;
   connection: Connection;
   provider: anchor.AnchorProvider;
-  wallet: anchor.Wallet;
+  wallet: NodeWallet;
   program: anchor.Program | null;
 };
 
@@ -27,23 +28,26 @@ type SolanaConfig = {
  * to simplify common tasks when working with Anchor.
  */
 export class AnchorUtils {
-  /*
-   * initWalletFromFile is a static function that initializes a wallet from a file.
-   * It takes a single argument, walletPath, which is the path to the file containing
-   * the wallet's secret key. It returns a Promise that resolves to a tuple containing
-   * the wallet and the keypair.
-   * @param filePath: string - The path to the file containing the wallet's secret key.
-   * @returns Promise<[anchor.Wallet, Keypair]> - A Promise that resolves to a tuple containing
-   * the wallet and the keypair.
+  /**
+   * Initializes a wallet from a file.
+   *
+   * @param {string} filePath - The path to the file containing the wallet's secret key.
+   * @returns {Promise<[NodeWallet, Keypair]>} A promise that resolves to a tuple containing the wallet and the keypair.
    */
   static async initWalletFromFile(
     filePath: string
-  ): Promise<[anchor.Wallet, Keypair]> {
+  ): Promise<[NodeWallet, Keypair]> {
     const keypair = await AnchorUtils.initKeypairFromFile(filePath);
-    const wallet: anchor.Wallet = new anchor.Wallet(keypair);
+    const wallet: NodeWallet = new NodeWallet(keypair);
     return [wallet, keypair];
   }
 
+  /**
+   * Initializes a keypair from a file.
+   *
+   * @param {string} filePath - The path to the file containing the keypair's secret key.
+   * @returns {Promise<Keypair>} A promise that resolves to the keypair.
+   */
   static async initKeypairFromFile(filePath: string): Promise<Keypair> {
     const secretKeyString = fs.readFileSync(filePath, { encoding: "utf8" });
     const secretKey: Uint8Array = Uint8Array.from(JSON.parse(secretKeyString));
@@ -51,6 +55,11 @@ export class AnchorUtils {
     return keypair;
   }
 
+  /**
+   * Loads an Anchor program from the environment.
+   *
+   * @returns {Promise<anchor.Program>} A promise that resolves to the loaded Anchor program.
+   */
   static async loadProgramFromEnv(): Promise<anchor.Program> {
     const config = await AnchorUtils.loadEnv();
     const idl = (await anchor.Program.fetchIdl(
@@ -61,6 +70,11 @@ export class AnchorUtils {
     return new anchor.Program(idl, config.provider);
   }
 
+  /**
+   * Loads the same environment set for the Solana CLI.
+   *
+   * @returns {Promise<SolanaConfig>} A promise that resolves to the Solana configuration.
+   */
   static async loadEnv(): Promise<SolanaConfig> {
     const configPath = path.join(
       os.homedir(),
@@ -82,10 +96,10 @@ export class AnchorUtils {
       connection: defaultCon,
       provider: new anchor.AnchorProvider(
         defaultCon,
-        new anchor.Wallet(defaultKeypair),
+        new NodeWallet(defaultKeypair),
         {}
       ),
-      wallet: new anchor.Wallet(defaultKeypair),
+      wallet: new NodeWallet(defaultKeypair),
       program: null,
     };
     config.keypair = (
@@ -94,7 +108,7 @@ export class AnchorUtils {
     config.connection = new Connection(config.rpcUrl, {
       commitment: "confirmed",
     });
-    config.wallet = new anchor.Wallet(config.keypair);
+    config.wallet = new NodeWallet(config.keypair);
     config.provider = new anchor.AnchorProvider(
       config.connection,
       config.wallet,
@@ -113,6 +127,13 @@ export class AnchorUtils {
     return config;
   }
 
+  /**
+   * Parse out anchor events from the logs present in the program IDL.
+   *
+   * @param {anchor.Program} program - The Anchor program instance.
+   * @param {string[]} logs - The array of logs to parse.
+   * @returns {any[]} An array of parsed events.
+   */
   static loggedEvents(program: anchor.Program, logs: string[]): any[] {
     const coder = new anchor.BorshEventCoder(program.idl);
     const out: any[] = [];
