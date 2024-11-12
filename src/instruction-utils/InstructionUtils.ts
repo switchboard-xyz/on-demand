@@ -74,6 +74,7 @@ export class InstructionUtils {
         sigVerify: false,
       }
     );
+
     const simulationUnitsConsumed = simulationResult.value.unitsConsumed!;
     const computeLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
       units: Math.floor(

@@ -1,37 +1,30 @@
 import type { FeedRequest } from "./../accounts/pullFeed.js";
-import { RecentSlotHashes } from "./../sysvars/recentSlothashes.js";
 
+import { TTLCache } from "@brokerloop/ttlcache";
 import type * as anchor from "@coral-xyz/anchor-30";
 import type { PublicKey } from "@solana/web3.js";
 import { OracleJob } from "@switchboard-xyz/common";
+import type { AxiosInstance } from "axios";
 import axios from "axios";
 import * as bs58 from "bs58";
-import { Agent as HttpsAgent } from "https";
-import NodeCache from "node-cache";
-import type { AxiosInstance } from "axios";
 
-const GATEWAY_PING_CACHE = new NodeCache({ stdTTL: 100, checkperiod: 120 });
-
-function newAbortSignal(timeoutMs: number): AbortSignal {
-  const abortController = new AbortController();
-  setTimeout(() => abortController.abort(), timeoutMs);
-
-  return abortController.signal;
-}
-
-const httpsAgent = new HttpsAgent({
-  rejectUnauthorized: false, // WARNING: This disables SSL/TLS certificate verification.
+const GATEWAY_PING_CACHE = new TTLCache<string, boolean>({
+  ttl: 100,
+  max: 50,
+  clock: Date,
 });
+
+// const httpsAgent = new HttpsAgent({
+//   rejectUnauthorized: false, // WARNING: This disables SSL/TLS certificate verification.
+// });
 const TIMEOUT = 10_000;
 
 const axiosClient: () => AxiosInstance = (() => {
-  let instance;
+  let instance: AxiosInstance;
 
   return () => {
     if (!instance) {
-      instance = axios.create({
-        httpsAgent,
-      });
+      instance = axios.create();
     }
     return instance;
   };
@@ -99,8 +92,19 @@ export type FeedEvalManyResponse = {
   recovery_id: number;
   errors: string[];
 };
+
 export type FetchSignaturesMultiResponse = {
   oracle_responses: FeedEvalManyResponse[];
+  errors: string[];
+};
+
+export type FeedEvalBatchResponse = {
+  feed_responses: FeedEvalResponse[];
+  errors: string[];
+};
+
+export type FetchSignaturesBatchResponse = {
+  oracle_responses: FeedEvalBatchResponse[];
   errors: string[];
 };
 
@@ -298,9 +302,13 @@ export interface BridgeEnclaveResponse {
  *  base64 encodes an array of oracle jobs. to send to a gateway
  */
 function encodeJobs(jobArray: OracleJob[]): string[] {
-  return jobArray.map((job) =>
-    Buffer.from(OracleJob.encodeDelimited(job).finish()).toString("base64")
-  );
+  return jobArray.map((job) => {
+    const encoded = OracleJob.encodeDelimited(
+      OracleJob.fromObject(job)
+    ).finish();
+    // const decoded = OracleJob.decodeDelimited(encoded);
+    return Buffer.from(encoded).toString("base64");
+  });
 }
 
 /**
@@ -449,39 +457,6 @@ export class Gateway {
       });
   }
 
-  /**
-   * Sends a request to the gateway bridge enclave.
-   *
-   * REST API endpoint: /api/v1/gateway_bridge_enclave
-   *
-   * @param chainHash The chain hash to include in the request.
-   * @param oraclePubkey The public key of the oracle.
-   * @param queuePubkey The public key of the queue.
-   * @returns A promise that resolves to the response.
-   * @throws if the request fails.
-   */
-  async fetchBridgingMessage(params: {
-    chainHash: string;
-    oraclePubkey: string;
-    queuePubkey: string;
-  }): Promise<BridgeEnclaveResponse> {
-    const api_version = "1.0.0";
-    const url = `${this.gatewayUrl}/gateway/api/v1/gateway_bridge_enclave`;
-    const method = "POST";
-    const headers = { "Content-Type": "application/json" };
-    const body = JSON.stringify({
-      api_version,
-      chain_hash: params.chainHash,
-      oracle_pubkey: params.oraclePubkey,
-      queue_pubkey: params.queuePubkey,
-    });
-    return axiosClient()
-      .post(url, body, { method, headers, timeout: TIMEOUT })
-      .then((r) => {
-        return r.data;
-      });
-  }
-
   // alberthermida@Switchboard ts % curl -X POST \
   // -H "Content-Type: application/json" \
   // -d '{
@@ -606,6 +581,139 @@ export class Gateway {
   }
 
   /**
+   * Fetches signatures from the gateway without pre-encoded jobs
+   * REST API endpoint: /api/v1/fetch_signatures_batch
+   *
+   * @param recentHash The chain metadata to sign with. Blockhash or slothash.
+   * @param feedConfigs The feed configurations to fetch signatures for.
+   * @param numSignatures The number of oracles to fetch signatures from.
+   * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+   * @returns A promise that resolves to the feed evaluation responses.
+   * @throws if the request fails.
+   */
+  async fetchSignaturesBatch(params: {
+    recentHash?: string;
+    feedConfigs: FeedRequest[];
+    numSignatures?: number;
+    useTimestamp?: boolean;
+  }): Promise<FetchSignaturesBatchResponse> {
+    const { recentHash, feedConfigs, useTimestamp, numSignatures } = params;
+    const encodedConfigs = feedConfigs.map((config) => {
+      const encodedJobs = encodeJobs(config.jobs);
+      return {
+        encodedJobs,
+        maxVariance: config.maxVariance ?? 1,
+        minResponses: config.minResponses ?? 1,
+      };
+    });
+    const res = await this.fetchSignaturesFromEncodedBatch({
+      recentHash,
+      encodedConfigs,
+      numSignatures: numSignatures ?? 1,
+      useTimestamp,
+    });
+    return res;
+  }
+
+  /**
+   * Fetches signatures from the gateway.
+   * REST API endpoint: /api/v1/fetch_signatures_batch
+   *
+   * @param recentHash The chain metadata to sign with. Blockhash or slothash.
+   * @param encodedConfigs The encoded feed configurations to fetch signatures for.
+   * @param numSignatures The number of oracles to fetch signatures from.
+   * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+   * @returns A promise that resolves to the feed evaluation responses.
+   * @throws if the request fails.
+   */
+  async fetchSignaturesFromEncodedBatch(params: {
+    recentHash?: string;
+    encodedConfigs: {
+      encodedJobs: string[];
+      maxVariance: number;
+      minResponses: number;
+    }[];
+    numSignatures: number;
+    useTimestamp?: boolean;
+  }): Promise<FetchSignaturesBatchResponse> {
+    const { recentHash, encodedConfigs, numSignatures } = params;
+    const url = `${this.gatewayUrl}/gateway/api/v1/fetch_signatures_batch`;
+    const method = "POST";
+    const headers = { "Content-Type": "application/json" };
+    const body = {
+      api_version: "1.0.0",
+      num_oracles: numSignatures,
+      recent_hash: recentHash ?? bs58.encode(Buffer.alloc(32, 0)),
+      signature_scheme: "Secp256k1",
+      hash_scheme: "Sha256",
+      feed_requests: [] as any,
+    };
+    for (const config of encodedConfigs) {
+      const maxVariance = Math.floor(Number(config.maxVariance ?? 1) * 1e9);
+      body.feed_requests.push({
+        jobs_b64_encoded: config.encodedJobs,
+        max_variance: maxVariance,
+        min_responses: config.minResponses ?? 1,
+        use_timestamp: params.useTimestamp ?? false,
+      });
+    }
+    const data = JSON.stringify(body);
+
+    // get size of data
+    try {
+      const resp = await axiosClient()(url, { method, headers, data }).then(
+        (r) => {
+          return {
+            ...r.data,
+          };
+        }
+      );
+
+      return resp;
+    } catch (err) {
+      console.error("fetchSignaturesFromEncodedBatch error", err);
+      throw err;
+    }
+  }
+
+  /**
+   * Sends a request to the gateway bridge enclave.
+   *
+   * REST API endpoint: /api/v1/gateway_bridge_enclave
+   *
+   * @param chainHash The chain hash to include in the request.
+   * @param oraclePubkey The public key of the oracle.
+   * @param queuePubkey The public key of the queue.
+   * @returns A promise that resolves to the response.
+   * @throws if the request fails.
+   */
+  async fetchBridgingMessage(params: {
+    chainHash: string;
+    oraclePubkey: string;
+    queuePubkey: string;
+  }): Promise<BridgeEnclaveResponse> {
+    const url = `${this.gatewayUrl}/gateway/api/v1/gateway_bridge_enclave`;
+    const method = "POST";
+    const headers = { "Content-Type": "application/json" };
+    const body = {
+      api_version: "1.0.0",
+      chain_hash: params.chainHash,
+      oracle_pubkey: params.oraclePubkey,
+      queue_pubkey: params.queuePubkey,
+    };
+    const data = JSON.stringify(body);
+
+    try {
+      const resp = await axiosClient()(url, { method, headers, data }).then(
+        (r) => r.data
+      );
+      return resp;
+    } catch (error: any) {
+      throw error;
+    }
+  }
+
+  /**
    * Fetches the randomness reveal from the gateway.
    * @param params The parameters for the randomness reveal.
    * @returns The randomness reveal response.
@@ -661,7 +769,7 @@ export class Gateway {
 
   async test(): Promise<boolean> {
     const url = `${this.gatewayUrl}/gateway/api/v1/test`;
-    const cachedResponse = GATEWAY_PING_CACHE.get<boolean>(this.gatewayUrl);
+    const cachedResponse = GATEWAY_PING_CACHE.get(this.gatewayUrl);
     if (cachedResponse !== undefined) {
       return cachedResponse;
     }

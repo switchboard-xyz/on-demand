@@ -1,9 +1,15 @@
-import { SB_ON_DEMAND_PID } from "../constants.js";
 import type {
+  FeedEvalBatchResponse,
   FeedEvalResponse,
+  FetchSignaturesBatchResponse,
   FetchSignaturesMultiResponse,
 } from "../oracle-interfaces/gateway.js";
 import { Gateway } from "../oracle-interfaces/gateway.js";
+import {
+  isMainnetConnection,
+  ON_DEMAND_DEVNET_PID,
+  ON_DEMAND_MAINNET_PID,
+} from "../utils";
 
 import * as spl from "./../utils/index.js";
 import type { SwitchboardPermission } from "./permission.js";
@@ -171,6 +177,151 @@ export class Queue {
     return [new Queue(program, queue.publicKey), queue, ix];
   }
 
+  /**
+   * Creates a new instance of the `Queue` account with a PDA for SVM (non-solana) chains.
+   * @param program The anchor program instance.
+   * @param params The initialization parameters for the queue.
+   * @returns
+   */
+  static async createIxSVM(
+    program: Program,
+    params: {
+      sourceQueueKey: PublicKey;
+      allowAuthorityOverrideAfter?: number;
+      requireAuthorityHeartbeatPermission?: boolean;
+      requireUsagePermission?: boolean;
+      maxQuoteVerificationAge?: number;
+      reward?: number;
+      nodeTimeout?: number;
+      lutSlot?: number;
+    }
+  ): Promise<[Queue, TransactionInstruction]> {
+    const stateKey = State.keyFromSeed(program);
+    const state = await State.loadData(program);
+
+    // Generate the queue PDA for the given source queue key
+    const [queue] = await PublicKey.findProgramAddress(
+      [Buffer.from("Queue"), params.sourceQueueKey.toBuffer()],
+      program.programId
+    );
+    const allowAuthorityOverrideAfter =
+      params.allowAuthorityOverrideAfter ?? 60 * 60;
+    const requireAuthorityHeartbeatPermission =
+      params.requireAuthorityHeartbeatPermission ?? true;
+    const requireUsagePermission = params.requireUsagePermission ?? false;
+    const maxQuoteVerificationAge =
+      params.maxQuoteVerificationAge ?? 60 * 60 * 24 * 7;
+    const reward = params.reward ?? 1000000;
+    const nodeTimeout = params.nodeTimeout ?? 300;
+    const payer = (program.provider as any).wallet.payer;
+    // Prepare accounts for the transaction
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), queue.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const [delegationGroup] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Group"),
+        stateKey.toBuffer(),
+        state.stakePool.toBuffer(),
+        queue.toBuffer(),
+      ],
+      state.stakeProgram
+    );
+    const recentSlot =
+      params.lutSlot ??
+      (await program.provider.connection.getSlot("finalized"));
+    const [_, lut] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot,
+    });
+
+    let stakePool = state.stakePool;
+    if (stakePool.equals(PublicKey.default)) {
+      stakePool = payer.publicKey;
+    }
+    const queueAccount = new Queue(program, queue);
+    const ix = program.instruction.queueInitSvm(
+      {
+        allowAuthorityOverrideAfter,
+        requireAuthorityHeartbeatPermission,
+        requireUsagePermission,
+        maxQuoteVerificationAge,
+        reward,
+        nodeTimeout,
+        recentSlot: new anchor.BN(recentSlot),
+        sourceQueueKey: params.sourceQueueKey,
+      },
+      {
+        accounts: {
+          queue: queue,
+          queueEscrow: await spl.getAssociatedTokenAddress(
+            spl.NATIVE_MINT,
+            queue,
+            true
+          ),
+          authority: payer.publicKey,
+          payer: payer.publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: spl.TOKEN_PROGRAM_ID,
+          nativeMint: spl.NATIVE_MINT,
+          programState: State.keyFromSeed(program),
+          lutSigner: await queueAccount.lutSigner(),
+          lut: await queueAccount.lutKey(recentSlot),
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
+          delegationGroup,
+          stakeProgram: state.stakeProgram,
+          stakePool: stakePool,
+          associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+        },
+        signers: [payer],
+      }
+    );
+    return [new Queue(program, queue), ix];
+  }
+
+  /**
+   * Add an Oracle to a queue and set permissions
+   * @param program
+   * @param params
+   */
+  async overrideSVM(params: {
+    oracle: PublicKey;
+    secp256k1Signer: Buffer;
+    maxQuoteVerificationAge: number;
+    mrEnclave: Buffer;
+    slot: number;
+  }) {
+    const stateKey = State.keyFromSeed(this.program);
+    const state = await State.loadData(this.program);
+    const programAuthority = state.authority;
+    const { authority } = await this.loadData();
+    if (!authority.equals(programAuthority)) {
+      throw new Error("Override failed: Invalid authority");
+    }
+
+    const ix = this.program.instruction.queueOverrideSvm(
+      {
+        secp256K1Signer: Array.from(params.secp256k1Signer),
+        maxQuoteVerificationAge: new anchor.BN(params.maxQuoteVerificationAge),
+        mrEnclave: params.mrEnclave,
+        slot: new anchor.BN(params.slot),
+      },
+      {
+        accounts: {
+          queue: this.pubkey,
+          oracle: params.oracle,
+          authority,
+          state: stateKey,
+        },
+      }
+    );
+    return ix;
+  }
+
   async initDelegationGroupIx(params: {
     lutSlot?: number;
     overrideStakePool?: PublicKey;
@@ -190,9 +341,14 @@ export class Queue {
       ],
       state.stakeProgram
     );
+    const isMainnet = isMainnetConnection(this.program.provider.connection);
+    let pid = ON_DEMAND_MAINNET_PID;
+    if (!isMainnet) {
+      pid = ON_DEMAND_DEVNET_PID;
+    }
     const [queueEscrowSigner] = await PublicKey.findProgramAddress(
       [Buffer.from("Signer"), this.pubkey.toBuffer()],
-      SB_ON_DEMAND_PID
+      pid
     );
     const ix = await this.program.instruction.queueInitDelegationGroup(
       {},
@@ -260,6 +416,20 @@ export class Queue {
   ): Promise<FetchSignaturesMultiResponse> {
     const queueAccount = new Queue(program, params.queue!);
     return queueAccount.fetchSignaturesMulti(params);
+  }
+
+  static async fetchSignaturesBatch(
+    program: Program,
+    params: {
+      gateway?: string;
+      queue: PublicKey;
+      recentHash?: string;
+      feedConfigs: FeedRequest[];
+      minResponses?: number;
+    }
+  ): Promise<FetchSignaturesBatchResponse> {
+    const queueAccount = new Queue(program, params.queue!);
+    return queueAccount.fetchSignaturesBatch(params);
   }
 
   /**
@@ -330,13 +500,13 @@ export class Queue {
       .filter((x: string) => x.length > 0)
       .filter((x: string) => !x.includes("infstones"));
 
-    const tests: any = [];
+    const tests: Promise<boolean>[] = [];
     for (const i in gatewayUris) {
       const gw = new Gateway(program, gatewayUris[i], oracles[i]);
       tests.push(gw.test());
     }
 
-    let gateways: any = [];
+    let gateways: Gateway[] = [];
     for (let i = 0; i < tests.length; i++) {
       try {
         const isGood = await withTimeout(tests[i], 2000);
@@ -372,6 +542,8 @@ export class Queue {
    *  @param recentHash The chain metadata to sign with. Blockhash or slothash.
    *  @param jobs The oracle jobs to perform.
    *  @param numSignatures The number of oracles to fetch signatures from.
+   *  @param maxVariance The maximum variance allowed in the responses.
+   *  @param minResponses The minimum number of responses to attempt to fetch.
    *  @returns A promise that resolves to the feed evaluation responses.
    *  @throws if the request fails.
    */
@@ -382,6 +554,7 @@ export class Queue {
     numSignatures?: number;
     maxVariance?: number;
     minResponses?: number;
+    chain?: string;
   }): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     let gateway = new Gateway(this.program, params.gateway ?? "");
     if (params.gateway === undefined) {
@@ -402,6 +575,20 @@ export class Queue {
       gateway = await this.fetchGateway();
     }
     return await gateway.fetchSignaturesMulti(params);
+  }
+
+  async fetchSignaturesBatch(params: {
+    gateway?: string;
+    queue: PublicKey;
+    recentHash?: string;
+    feedConfigs: FeedRequest[];
+    minResponses?: number;
+  }): Promise<FetchSignaturesBatchResponse> {
+    let gateway = new Gateway(this.program, params.gateway ?? "");
+    if (params.gateway === undefined) {
+      gateway = await this.fetchGateway();
+    }
+    return await gateway.fetchSignaturesBatch(params);
   }
 
   /**
@@ -562,8 +749,28 @@ export class Queue {
       this.program.provider.connection,
       oracles
     );
+    const oracleUris = oracleAccounts
+      .map((x: any) => coder.decode("oracleAccountData", x.account.data))
+      .map((x: any) => String.fromCharCode(...x.gatewayUri))
+      .map((x: string) => removeTrailingNullBytes(x))
+      .filter((x: string) => x.length > 0);
+
+    const tests: Promise<boolean>[] = [];
+    for (const i in oracleUris) {
+      const gw = new Gateway(this.program, oracleUris[i], oracles[i]);
+      tests.push(gw.test());
+    }
+
     const zip: any = [];
     for (let i = 0; i < oracles.length; i++) {
+      try {
+        const isGood = await withTimeout(tests[i], 2000);
+        if (!isGood) {
+          continue;
+        }
+      } catch (e) {
+        console.log("Gateway Timeout", e);
+      }
       zip.push({
         data: coder.decode(
           "oracleAccountData",
@@ -578,6 +785,28 @@ export class Queue {
     const chosen =
       validOracles[Math.floor(Math.random() * validOracles.length)];
     return chosen.key;
+  }
+
+  /**
+   * Get the PDA for the queue (SVM chains that are not solana)
+   * @returns Queue PDA Pubkey
+   */
+  queuePDA(): PublicKey {
+    return Queue.queuePDA(this.program, this.pubkey);
+  }
+
+  /**
+   * Get the PDA for the queue (SVM chains that are not solana)
+   * @param program Anchor program
+   * @param pubkey Queue pubkey
+   * @returns Queue PDA Pubkey
+   */
+  static queuePDA(program: Program, pubkey: PublicKey): PublicKey {
+    const [queuePDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("Queue"), pubkey.toBuffer()],
+      program.programId
+    );
+    return queuePDA;
   }
 
   async lutSigner(): Promise<PublicKey> {

@@ -6,7 +6,7 @@ import { Queue } from "../accounts/queue.js";
 import * as anchor from "@coral-xyz/anchor-30";
 import NodeWallet from "@coral-xyz/anchor-30/dist/cjs/nodewallet.js";
 import type { AddressLookupTableAccount } from "@solana/web3.js";
-import { PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import type { IOracleJob } from "@switchboard-xyz/common";
 import { CrossbarClient } from "@switchboard-xyz/common";
 
@@ -30,7 +30,10 @@ export function createLoadLookupTables() {
       }
     }
 
-    const out = Array.from(promiseMap.values());
+    const out = [];
+    for (const account of accounts) {
+      out.push(promiseMap.get(account.pubkey.toString()));
+    }
     return Promise.all(out);
   }
 
@@ -40,20 +43,56 @@ export function createLoadLookupTables() {
 export const loadLookupTables = createLoadLookupTables();
 
 // Mainnet ID's
-export const ON_DEMAND_MAINNET_PID =
-  "SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv";
-export const ON_DEMAND_MAINNET_GUARDIAN_QUEUE =
-  "B7WgdyAgzK7yGoxfsBaNnY6d41bTybTzEh4ZuQosnvLK";
-export const ON_DEMAND_MAINNET_QUEUE =
-  "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w";
+export const ON_DEMAND_MAINNET_PID = new PublicKey(
+  "SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv"
+);
+export const ON_DEMAND_MAINNET_GUARDIAN_QUEUE = new PublicKey(
+  "B7WgdyAgzK7yGoxfsBaNnY6d41bTybTzEh4ZuQosnvLK"
+);
+export const ON_DEMAND_MAINNET_QUEUE = new PublicKey(
+  "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w"
+);
 
 // Devnet ID's
-export const ON_DEMAND_DEVNET_PID =
-  "SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv";
-export const ON_DEMAND_DEVNET_GUARDIAN_QUEUE =
-  "Did69tHXs3NTTomR4ZBzttKjB6W3dssavL8uafVbJ1Q";
-export const ON_DEMAND_DEVNET_QUEUE =
-  "FfD96yeXs4cxZshoPPSKhSPgVQxLAJUT3gefgh84m1Di";
+export const ON_DEMAND_DEVNET_PID = new PublicKey(
+  "Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2"
+);
+export const ON_DEMAND_DEVNET_GUARDIAN_QUEUE = new PublicKey(
+  "BeZ4tU4HNe2fGQGUzJmNS2UU2TcZdMUUgnCH6RPg4Dpi"
+);
+export const ON_DEMAND_DEVNET_QUEUE = new PublicKey(
+  "EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7"
+);
+
+/**
+ * Check if the connection is to the mainnet
+ * @param connection - Connection: The connection
+ * @returns - Promise<boolean> - Whether the connection is to the mainnet
+ */
+export async function isMainnetConnection(
+  connection: Connection
+): Promise<boolean> {
+  try {
+    const block = await connection.getBlock(116650000);
+    if (!block) {
+      return false;
+    }
+
+    return block.blockhash === "AZxydBEE2JTJZMEPyCJCycKHe4Jau6j9Evw9oT3Aujts";
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Get the program ID for the Switchboard program based on the connection
+ * @param connection - Connection: The connection
+ * @returns - Promise<PublicKey> - The program ID
+ */
+export async function getProgramId(connection: Connection): Promise<PublicKey> {
+  const isMainnet = await isMainnetConnection(connection);
+  return isMainnet ? ON_DEMAND_MAINNET_PID : ON_DEMAND_DEVNET_PID;
+}
 
 /**
  * Get the default devnet queue for the Switchboard program
@@ -94,11 +133,19 @@ export async function getDefaultDevnetGuardianQueue(
 export async function getDefaultQueue(
   solanaRPCUrl: string = "https://api.mainnet-beta.solana.com"
 ): Promise<Queue> {
-  return getQueue(
-    solanaRPCUrl,
-    ON_DEMAND_MAINNET_PID.toString(),
-    ON_DEMAND_MAINNET_QUEUE.toString()
-  );
+  if (await isMainnetConnection(new Connection(solanaRPCUrl, "confirmed"))) {
+    return getQueue(
+      solanaRPCUrl,
+      ON_DEMAND_MAINNET_PID.toString(),
+      ON_DEMAND_MAINNET_QUEUE.toString()
+    );
+  } else {
+    return getQueue(
+      solanaRPCUrl,
+      ON_DEMAND_DEVNET_PID.toString(),
+      ON_DEMAND_DEVNET_QUEUE.toString()
+    );
+  }
 }
 
 /**

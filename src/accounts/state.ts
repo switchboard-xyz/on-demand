@@ -90,6 +90,8 @@ export class State {
     epochLength?: BN;
     resetEpochs?: boolean;
     enableStaking?: boolean;
+    addCostWl?: PublicKey;
+    rmCostWl?: PublicKey;
   }): Promise<TransactionInstruction> {
     const state = await this.loadData();
     const queue = params.guardianQueue ?? state.guardianQueue;
@@ -113,6 +115,8 @@ export class State {
         switchMint: params.switchMint ?? state.switchMint,
         enableStaking: params.enableStaking ?? state.enableStaking,
         authority: params.newAuthority ?? state.authority,
+        addCostWl: params.addCostWl ?? PublicKey.default,
+        rmCostWl: params.rmCostWl ?? PublicKey.default,
       },
       {
         accounts: {

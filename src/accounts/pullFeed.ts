@@ -1,14 +1,22 @@
 import { SLOT_HASHES_SYSVAR_ID } from "../constants.js";
-import type { FeedEvalResponse } from "../oracle-interfaces/gateway.js";
+import type {
+  FeedEvalResponse,
+  FetchSignaturesMultiResponse,
+} from "../oracle-interfaces/gateway.js";
 
 import { InstructionUtils } from "./../instruction-utils/InstructionUtils.js";
 import { RecentSlotHashes } from "./../sysvars/recentSlothashes.js";
 import * as spl from "./../utils/index.js";
-import { loadLookupTables } from "./../utils/index.js";
+import {
+  getDefaultDevnetQueue,
+  getDefaultQueue,
+  loadLookupTables,
+} from "./../utils/index.js";
 import { Oracle } from "./oracle.js";
 import { Queue } from "./queue.js";
 import { State } from "./state.js";
 
+import { TTLCache } from "@brokerloop/ttlcache";
 import type { Program } from "@coral-xyz/anchor-30";
 import { BorshAccountsCoder } from "@coral-xyz/anchor-30";
 import * as anchor from "@coral-xyz/anchor-30";
@@ -29,7 +37,14 @@ import {
 import type { IOracleJob } from "@switchboard-xyz/common";
 import { OracleJob } from "@switchboard-xyz/common";
 import { CrossbarClient, FeedHash } from "@switchboard-xyz/common";
+import { bs58 } from "@switchboard-xyz/common";
 import Big from "big.js";
+
+const QUEUE_CACHE = new TTLCache<string, Queue>({
+  ttl: 60 * 1000,
+  max: 50,
+  clock: Date,
+});
 
 const PRECISION = 18;
 
@@ -45,6 +60,12 @@ export interface CurrentResult {
   maxSlot: BN;
 }
 
+export interface CompactResult {
+  stdDev: number;
+  mean: number;
+  slot: BN;
+}
+
 export interface OracleSubmission {
   oracle: PublicKey;
   slot: BN;
@@ -55,31 +76,43 @@ export interface PullFeedAccountData {
   submissions: OracleSubmission[];
   authority: PublicKey;
   queue: PublicKey;
-  feedHash: Buffer;
+  feedHash: Uint8Array;
   initializedAt: BN;
   permissions: BN;
   maxVariance: BN;
   minResponses: number;
-  name: Buffer;
+  name: Uint8Array;
   sampleSize: number;
   lastUpdateTimestamp: BN;
   lutSlot: BN;
   result: CurrentResult;
   maxStaleness: number;
   minSampleSize: number;
+  historicalResultIdx: number;
+  historicalResults: CompactResult[];
 }
 
 export type MultiSubmission = {
   values: anchor.BN[];
-  signature: Buffer;
+  signature: Buffer; // TODO: Does this need to be made a Uint8Array too?
   recoveryId: number;
 };
 
-export type OracleResponse = {
-  oracle: Oracle;
-  value: Big | null;
-  error: string;
-};
+export class OracleResponse {
+  constructor(
+    readonly oracle: Oracle,
+    readonly value: Big | null,
+    readonly error: string
+  ) {}
+
+  shortError(): string | undefined {
+    if (this.error === "[]") {
+      return undefined;
+    }
+    const parts = this.error.split("\n");
+    return parts[0];
+  }
+}
 
 export type FeedRequest = {
   maxVariance: number;
@@ -194,6 +227,10 @@ export class PullFeed {
     return [pullFeed, tx];
   }
 
+  private getPayer(payer?: PublicKey): PublicKey {
+    return payer ?? this.program.provider.publicKey ?? PublicKey.default;
+  }
+
   /**
    *  Calls to initialize a pull feed account and to update the configuration account need to
    *  compute the feed hash for the account (if one is not specified).
@@ -245,8 +282,7 @@ export class PullFeed {
       feedHash: "feedHash" in params ? params.feedHash : undefined,
       jobs: "jobs" in params ? params.jobs : undefined,
     });
-    const payerPublicKey =
-      params.payer ?? this.program.provider.publicKey ?? PublicKey.default;
+    const payerPublicKey = this.getPayer(params.payer);
     const maxVariance = Math.floor(params.maxVariance * 1e9);
     const lutSigner = (
       await PublicKey.findProgramAddress(
@@ -300,8 +336,7 @@ export class PullFeed {
   async closeIx(params: {
     payer?: PublicKey;
   }): Promise<TransactionInstruction> {
-    const payerPublicKey =
-      params.payer ?? this.program.provider.publicKey ?? PublicKey.default;
+    const payerPublicKey = this.getPayer(params.payer);
     const lutSigner = (
       await PublicKey.findProgramAddress(
         [Buffer.from("LutSigner"), this.pubkey.toBuffer()],
@@ -425,29 +460,48 @@ export class PullFeed {
       jobs?: IOracleJob[];
       crossbarClient?: CrossbarClient;
       retries?: number;
+      chain?: string;
+      network?: "mainnet" | "mainnet-beta" | "testnet" | "devnet";
+      solanaRpcUrl?: string;
     },
     recentSlothashes?: Array<[anchor.BN, string]>,
     priceSignatures?: FeedEvalResponse[],
-    debug: boolean = false
+    debug: boolean = false,
+    payer?: PublicKey
   ): Promise<
     [
       TransactionInstruction | undefined,
       OracleResponse[],
       number,
-      any[],
+      AddressLookupTableAccount[],
       string[]
     ]
   > {
+    const payerPublicKey = this.getPayer(payer);
     if (this.configs === null) {
       this.configs = await this.loadConfigs();
     }
+
     params_ = params_ ?? {};
     params_.retries = params_.retries ?? 3;
     const feedConfigs = this.configs;
     const numSignatures =
       params_?.numSignatures ??
       feedConfigs.minSampleSize + Math.ceil(feedConfigs.minSampleSize / 3);
-    const queueAccount = new Queue(this.program, feedConfigs.queue);
+    const isSolana =
+      params_?.chain === undefined || params_?.chain === "solana";
+    const isMainnet =
+      params_?.network === "mainnet" || params_?.network === "mainnet-beta";
+
+    let queueAccount = new Queue(this.program, feedConfigs.queue);
+
+    if (!isSolana) {
+      // TODO: cache this
+      queueAccount = isMainnet
+        ? await getDefaultQueue(params_?.solanaRpcUrl)
+        : await getDefaultDevnetQueue(params_?.solanaRpcUrl);
+    }
+
     if (this.gatewayUrl === "") {
       this.gatewayUrl =
         params_?.gateway ??
@@ -458,7 +512,9 @@ export class PullFeed {
       const data = await this.loadData();
       jobs = await (params_?.crossbarClient ?? CrossbarClient.default())
         .fetch(Buffer.from(data.feedHash).toString("hex"))
-        .then((resp) => resp.jobs);
+        .then((resp) => {
+          return resp.jobs;
+        });
       this.jobs = jobs;
     }
     const params = {
@@ -477,7 +533,8 @@ export class PullFeed {
           params,
           recentSlothashes,
           priceSignatures,
-          debug
+          debug,
+          payerPublicKey
         );
         return ix;
       } catch (err_: any) {
@@ -505,7 +562,7 @@ export class PullFeed {
       queue: data.queue,
       maxVariance: maxVariance,
       minResponses: data.minResponses,
-      feedHash: data.feedHash,
+      feedHash: Buffer.from(data.feedHash),
       minSampleSize: data.minSampleSize,
     };
   }
@@ -515,6 +572,7 @@ export class PullFeed {
    *
    * @param params_ - The parameters object.
    * @param params_.gateway - Optionally specify the gateway to use. If not specified, the gateway is automatically fetched.
+   * @param params._chain - Optionally specify the chain to use. If not specified, Solana is used.
    * @param params_.numSignatures - Number of signatures to fetch.
    * @param params_.feedConfigs - Optionally specify the feed configs. If not specified, the feed configs are automatically fetched.
    * @param params_.jobs - An array of `IOracleJob` representing the jobs to be executed.
@@ -533,6 +591,9 @@ export class PullFeed {
     program: Program,
     params_: {
       gateway?: string;
+      chain?: string;
+      network?: "mainnet" | "mainnet-beta" | "testnet" | "devnet";
+      solanaRpcUrl?: string;
       queue: PublicKey;
       feed: PublicKey;
       numSignatures: number;
@@ -550,7 +611,7 @@ export class PullFeed {
       TransactionInstruction | undefined,
       OracleResponse[],
       number,
-      any[],
+      AddressLookupTableAccount[],
       string[]
     ]
   > {
@@ -564,16 +625,39 @@ export class PullFeed {
     const feed = new PullFeed(program, params_.feed);
     const params = params_;
     const jobs = params.jobs;
+    const isSolana = params.chain === undefined || params.chain === "solana";
+    const isMainnet =
+      params.network === "mainnet" || params.network === "mainnet-beta";
+    let queue = params.queue;
+
     let failures_: string[] = [];
     if (priceSignatures === undefined || priceSignatures === null) {
-      const { responses, failures } = await Queue.fetchSignatures(program, {
-        ...params,
-        jobs: jobs!.map((x) => OracleJob.create(x)),
-        recentHash: slotHashes[0][1],
-      });
+      let solanaProgram = program;
+
+      // get the queue
+      if (!isSolana) {
+        // TODO: cache this
+        const defaultQueue = isMainnet
+          ? await getDefaultQueue(params.solanaRpcUrl)
+          : await getDefaultDevnetQueue(params.solanaRpcUrl);
+
+        queue = defaultQueue.pubkey;
+        solanaProgram = defaultQueue.program;
+      }
+
+      const { responses, failures } = await Queue.fetchSignatures(
+        solanaProgram,
+        {
+          ...params,
+          queue,
+          jobs: jobs!.map((x) => OracleJob.fromObject(x)),
+          recentHash: slotHashes[0][1],
+        }
+      );
       priceSignatures = responses;
       failures_ = failures;
     }
+
     let numSuccesses = 0;
     if (!priceSignatures) {
       return [undefined, [], 0, [], []];
@@ -586,14 +670,18 @@ export class PullFeed {
         numSuccesses += 1;
       }
       Big.DP = oldDP;
-      return {
+      let oracle = new PublicKey(Buffer.from(x.oracle_pubkey, "hex"));
+      if (!isSolana) {
+        [oracle] = PublicKey.findProgramAddressSync(
+          [Buffer.from("Oracle"), params.queue.toBuffer(), oracle.toBuffer()],
+          program.programId
+        );
+      }
+      return new OracleResponse(
+        new Oracle(program, oracle),
         value,
-        error: x.failure_error,
-        oracle: new Oracle(
-          program,
-          new PublicKey(Buffer.from(x.oracle_pubkey, "hex"))
-        ),
-      };
+        x.failure_error
+      );
     });
 
     const offsets: number[] = new Array(priceSignatures.length).fill(0);
@@ -620,6 +708,7 @@ export class PullFeed {
     if (debug) {
       console.log("priceSignatures", priceSignatures);
     }
+
     let submitSignaturesIx: TransactionInstruction | undefined = undefined;
     if (numSuccesses > 0) {
       submitSignaturesIx = feed.getSolanaSubmitSignaturesIx({
@@ -627,8 +716,10 @@ export class PullFeed {
         offsets: offsets,
         slot: slotHashes[0][0],
         payer,
+        chain: params.chain,
       });
     }
+
     const lutOwners = [...oracleResponses.map((x) => x.oracle), feed];
     const luts = await loadLookupTables(lutOwners);
     if (!numSuccesses) {
@@ -640,7 +731,7 @@ export class PullFeed {
   }
 
   /**
-   * Fetches updates for multiple feeds at once.
+   * Fetches updates for multiple feeds at once into SEPARATE intructions (one for each)
    *
    * @param program - The Anchor program instance.
    * @param params_ - The parameters object.
@@ -656,7 +747,7 @@ export class PullFeed {
    * - An array of `AddressLookupTableAccount` to use.
    * - The raw response data.
    */
-  static async fetchUpdateManyIx(
+  static async fetchUpdateManyIxs(
     program: Program,
     params_: {
       gateway?: string;
@@ -668,7 +759,248 @@ export class PullFeed {
     recentSlothashes?: Array<[anchor.BN, string]>,
     debug: boolean = false,
     payer?: PublicKey
-  ): Promise<[TransactionInstruction, AddressLookupTableAccount[], any]> {
+  ): Promise<{
+    successes: {
+      submitSignaturesIx: TransactionInstruction;
+      oracleResponses: {
+        value: Big.Big;
+        error: string;
+        oracle: Oracle;
+      };
+      numSuccesses: number;
+      luts: AddressLookupTableAccount[];
+      failures: string[];
+    }[];
+    failures: {
+      feed: PublicKey;
+      error: string;
+    }[];
+  }> {
+    const slotHashes =
+      recentSlothashes ??
+      (await RecentSlotHashes.fetchLatestNSlothashes(
+        program.provider.connection,
+        30
+      ));
+    const feeds = params_.feeds.map((feed) => new PullFeed(program, feed));
+    const params = params_;
+    const feedConfigs: {
+      maxVariance: number;
+      minResponses: number;
+      jobs: any;
+    }[] = [];
+    let queue: PublicKey | undefined = undefined;
+
+    // Map from feed hash to feed - this will help in mapping the responses to the feeds
+    const feedToFeedHash = new Map<string, string>();
+
+    // Map from feed hash to responses
+    const feedHashToResponses = new Map<string, FeedEvalResponse[]>();
+
+    // Iterate over all feeds to fetch the feed configs
+    for (const feed of feeds) {
+      // Load the feed from Solana
+      const data = await feed.loadData();
+      if (queue !== undefined && !queue.equals(data.queue)) {
+        throw new Error(
+          "fetchUpdateManyIx: All feeds must have the same queue"
+        );
+      }
+      queue = data.queue;
+      const maxVariance = data.maxVariance.toNumber() / 1e9;
+      const minResponses = data.minResponses;
+      const feedHash = Buffer.from(data.feedHash).toString("hex");
+
+      // Store the feed in a map for later use
+      feedToFeedHash.set(feed.pubkey.toString(), feedHash);
+
+      // Add an entry for the feed in the response map
+      feedHashToResponses.set(feedHash, []);
+
+      // Pull the job definitions
+      const jobs = await (params_.crossbarClient ?? CrossbarClient.default())
+        .fetch(feedHash)
+        .then((resp) => {
+          return resp.jobs;
+        });
+
+      // Collect the feed config
+      feedConfigs.push({
+        maxVariance,
+        minResponses,
+        jobs,
+      });
+    }
+
+    // Fetch the responses from the oracle(s)
+    const response = await Queue.fetchSignaturesBatch(program, {
+      ...params,
+      recentHash: slotHashes[0][1],
+      feedConfigs,
+      queue: queue!,
+    });
+
+    const oracles: PublicKey[] = [];
+
+    // Assemble the responses
+    for (const oracleResponse of response.oracle_responses) {
+      // Get the oracle public key
+      const oraclePubkey = new PublicKey(
+        Buffer.from(oracleResponse.feed_responses[0].oracle_pubkey, "hex")
+      );
+
+      // Add it to the list of oracles
+      oracles.push(oraclePubkey);
+
+      // Map the responses to the feed
+      for (const feedResponse of oracleResponse.feed_responses) {
+        const feedHash = feedResponse.feed_hash;
+        feedHashToResponses.get(feedHash)?.push(feedResponse);
+      }
+    }
+
+    // loop over the feeds and create the instructions
+    const successes = [];
+    const failures = [];
+
+    for (const feed of feeds) {
+      const feedHash = feedToFeedHash.get(feed.pubkey.toString());
+
+      // Get registered responses for this feed
+      const responses = feedHashToResponses.get(feedHash) ?? [];
+
+      // If there are no responses for this feed, skip
+      if (responses.length === 0) {
+        failures.push({
+          feed: feed.pubkey,
+          error: `No responses found for feed hash: ${feedHash}. Skipping.`,
+        });
+        continue;
+      }
+
+      const oracleResponses = responses.map((x) => {
+        const oldDP = Big.DP;
+        Big.DP = 40;
+        const value = x.success_value
+          ? new Big(x.success_value).div(1e18)
+          : null;
+        Big.DP = oldDP;
+        return {
+          value,
+          error: x.failure_error,
+          oracle: new Oracle(
+            program,
+            new PublicKey(Buffer.from(x.oracle_pubkey, "hex"))
+          ),
+        };
+      });
+
+      // offsets currently deprecated
+      const offsets: number[] = Array(responses.length).fill(0);
+
+      if (debug) {
+        console.log("priceSignatures", responses);
+      }
+
+      let submitSignaturesIx: TransactionInstruction | undefined = undefined;
+      let numSuccesses = 0;
+      if (responses.length > 0) {
+        const validResponses = responses.filter(
+          (x) => (x.signature ?? "").length > 0
+        );
+        numSuccesses = validResponses.length;
+        if (numSuccesses > 0) {
+          submitSignaturesIx = feed.getSolanaSubmitSignaturesIx({
+            resps: validResponses,
+            offsets: offsets,
+            slot: slotHashes[0][0],
+            payer: params.payer ?? program.provider.publicKey,
+          });
+        }
+      }
+
+      // Bounce if there are no successes
+      if (!numSuccesses) {
+        const failure = {
+          feed: feed.pubkey,
+          error: `PullFeed.fetchUpdateIx Failure: ${oracleResponses.map(
+            (x) => x.error
+          )}`,
+        };
+        failures.push(failure);
+        continue;
+      }
+
+      // Get lookup tables for the oracles
+      const lutOwners = [...oracleResponses.map((x) => x.oracle), feed];
+      const luts = await loadLookupTables(lutOwners);
+
+      // Add the result to the successes array
+      successes.push({
+        feed: feed.pubkey,
+        submitSignaturesIx,
+        oracleResponses,
+        numSuccesses,
+        luts,
+        failures: responses.map((x) => x.failure_error),
+      });
+    }
+
+    return {
+      successes,
+      failures,
+    };
+  }
+
+  /**
+   * Prefetch all lookup tables needed for the feed and queue.
+   * @returns A promise that resolves to an array of lookup tables.
+   * @throws if the lookup tables cannot be loaded.
+   */
+  async preHeatLuts(): Promise<AddressLookupTableAccount[]> {
+    const data = await this.loadData();
+    const queue = new Queue(this.program, data.queue);
+    const oracleKeys = await queue.fetchOracleKeys();
+    const oracles = oracleKeys.map((k) => new Oracle(this.program, k));
+    const lutOwners = [...oracles, queue, this];
+    const luts = await loadLookupTables(lutOwners);
+    return luts;
+  }
+
+  /**
+   * Fetches updates for multiple feeds at once into a SINGLE tightly packed intruction
+   *
+   * @param program - The Anchor program instance.
+   * @param params_ - The parameters object.
+   * @param params_.gateway - The gateway URL to use. If not provided, the gateway is automatically fetched.
+   * @param params_.feeds - An array of feed account public keys.
+   * @param params_.numSignatures - The number of signatures to fetch.
+   * @param params_.crossbarClient - Optionally specify the CrossbarClient to use.
+   * @param recentSlothashes - An optional array of recent slothashes as `[anchor.BN, string]` tuples.
+   * @param debug - A boolean flag to enable or disable debug mode. Defaults to `false`.
+   * @returns A promise that resolves to a tuple containing:
+   * - The transaction instruction for fetching updates.
+   * - An array of `AddressLookupTableAccount` to use.
+   * - The raw response data.
+   */
+  static async fetchUpdateManyIx(
+    program: Program,
+    params_: {
+      gateway?: string;
+      feeds: PublicKey[];
+      numSignatures: number;
+      crossbarClient?: CrossbarClient;
+      payer?: PublicKey;
+    },
+    recentSlothashes?: Array<[anchor.BN, string]>,
+    debug: boolean = false
+  ): Promise<
+    [
+      TransactionInstruction,
+      AddressLookupTableAccount[],
+      FetchSignaturesMultiResponse
+    ]
+  > {
     const slotHashes =
       recentSlothashes ??
       (await RecentSlotHashes.fetchLatestNSlothashes(
@@ -708,7 +1040,6 @@ export class PullFeed {
       feedConfigs,
       queue: queue!,
     });
-    const numResponses = response.oracle_responses.length;
     const oracles: PublicKey[] = [];
     const submissions: any[] = [];
     const maxI128 = new BN(2).pow(new BN(127)).sub(new BN(1));
@@ -805,17 +1136,44 @@ export class PullFeed {
     offsets: number[];
     slot: anchor.BN;
     payer?: PublicKey;
+    chain?: string;
   }): TransactionInstruction {
     const program = this.program;
     const payerPublicKey =
       params.payer ?? program.provider.publicKey ?? PublicKey.default;
     const resps = params.resps.filter((x) => (x.signature ?? "").length > 0);
-    const queue = new PublicKey(
+    const isSolana = params.chain === "solana" || params.chain === undefined;
+
+    let queue = new PublicKey(
       Buffer.from(resps[0].queue_pubkey.toString(), "hex")
     );
-    const oracles = resps.map(
-      (x) => new PublicKey(Buffer.from(x.oracle_pubkey.toString(), "hex"))
+    const sourceQueueKey = new PublicKey(
+      Buffer.from(resps[0].queue_pubkey.toString(), "hex")
     );
+    let queueBump = 0;
+
+    if (!isSolana) {
+      [queue, queueBump] = PublicKey.findProgramAddressSync(
+        [Buffer.from("Queue"), queue.toBuffer()],
+        program.programId
+      );
+    }
+
+    const oracles = resps.map((x) => {
+      const sourceOracleKey = new PublicKey(
+        Buffer.from(x.oracle_pubkey.toString(), "hex")
+      );
+      if (isSolana) {
+        return sourceOracleKey;
+      } else {
+        const [oraclePDA] = PublicKey.findProgramAddressSync(
+          [Buffer.from("Oracle"), queue.toBuffer(), sourceOracleKey.toBuffer()],
+          program.programId
+        );
+        return oraclePDA;
+      }
+    });
+
     const oracleFeedStats = oracles.map(
       (oracle) =>
         PublicKey.findProgramAddressSync(
@@ -823,18 +1181,24 @@ export class PullFeed {
           program.programId
         )[0]
     );
+
     const submissions = resps.map((resp, idx) => ({
       value: new anchor.BN(resp.success_value.toString()),
       signature: resp.signature,
       recoveryId: resp.recovery_id,
-      slotOffset: params.offsets[idx],
+
+      // offsets aren't used in the non-solana endpoint
+      slotOffset: isSolana ? params.offsets[idx] : undefined,
     }));
+
     const instructionData = {
       slot: new anchor.BN(params.slot),
       submissions: submissions.map((x: any) => {
         x.signature = Buffer.from(x.signature, "base64");
         return x;
       }),
+      sourceQueueKey: isSolana ? undefined : sourceQueueKey,
+      queueBump: isSolana ? undefined : queueBump,
     };
 
     const accounts = {
@@ -844,10 +1208,15 @@ export class PullFeed {
       recentSlothashes: SLOT_HASHES_SYSVAR_ID,
       payer: payerPublicKey,
       systemProgram: SystemProgram.programId,
-      rewardVault: spl.getAssociatedTokenAddressSync(spl.NATIVE_MINT, queue),
+      rewardVault: spl.getAssociatedTokenAddressSync(
+        spl.NATIVE_MINT,
+        queue,
+        !isSolana
+      ),
       tokenProgram: spl.TOKEN_PROGRAM_ID,
       tokenMint: spl.NATIVE_MINT,
     };
+
     const remainingAccounts: AccountMeta[] = [
       ...oracles.map((k) => ({
         pubkey: k,
@@ -860,11 +1229,18 @@ export class PullFeed {
         isWritable: true,
       })),
     ];
-    const ix = program.instruction.pullFeedSubmitResponse(instructionData, {
-      accounts,
-      remainingAccounts,
-    });
-    return ix;
+
+    if (isSolana) {
+      return program.instruction.pullFeedSubmitResponse(instructionData, {
+        accounts,
+        remainingAccounts,
+      });
+    } else {
+      return program.instruction.pullFeedSubmitResponseSvm(instructionData, {
+        accounts,
+        remainingAccounts,
+      });
+    }
   }
 
   /**
@@ -1036,5 +1412,15 @@ export class PullFeed {
     );
     this.lut = accnt.value!;
     return this.lut!;
+  }
+
+  async loadHistoricalValuesCompact(
+    data_?: PullFeedAccountData
+  ): Promise<CompactResult[]> {
+    const data = data_ ?? (await this.loadData());
+    const values = data.historicalResults
+      .filter((x) => x.slot.gt(new BN(0)))
+      .sort((a, b) => a.slot.cmp(b.slot));
+    return values;
   }
 }

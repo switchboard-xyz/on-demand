@@ -163,6 +163,187 @@ export class Oracle {
     return [new Oracle(program, oracle.publicKey), [ix, ix2], oracle];
   }
 
+  /**
+   * Creates a new oracle account for SVM chains (non-solana). linked to the specified queue.
+   * After creation the oracle still must receive run approval and verify their
+   * enclave measurement.
+   * @param program - The program that owns the oracle account.
+   * @param params.queue - The queue that the oracle will be linked to.
+   * @returns A promise that resolves to a tuple containing the oracle account
+   * and the transaction signature.
+   *
+   */
+  static async createSVM(
+    program: Program,
+    params: {
+      queue: PublicKey;
+      sourceOracleKey: PublicKey;
+    }
+  ): Promise<[Oracle, TransactionInstruction[]]> {
+    const stateKey = State.keyFromSeed(program);
+    const state = await State.loadData(program);
+    const payer = (program.provider as any).wallet.payer;
+    // Generate the queue PDA for the given source queue key
+    const [oracle] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Oracle"),
+        params.queue.toBuffer(),
+        params.sourceOracleKey.toBuffer(),
+      ],
+      program.programId
+    );
+    const oracleStats = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("OracleStats"), oracle.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const lutSigner = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("LutSigner"), oracle.toBuffer()],
+        program.programId
+      )
+    )[0];
+    const [delegationPool] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Delegation"),
+        stateKey.toBuffer(),
+        oracleStats.toBuffer(),
+        state.stakePool.toBuffer(),
+      ],
+      state.stakeProgram
+    );
+    const recentSlot = await program.provider.connection.getSlot("finalized");
+    const [_, lut] = AddressLookupTableProgram.createLookupTable({
+      authority: lutSigner,
+      payer: payer.publicKey,
+      recentSlot,
+    });
+    const [delegationGroup] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Group"),
+        stateKey.toBuffer(),
+        state.stakePool.toBuffer(),
+        params.queue.toBuffer(),
+      ],
+      state.stakeProgram
+    );
+
+    const ix = program.instruction.oracleInitSvm(
+      {
+        recentSlot: new BN(recentSlot.toString()),
+        authority: payer.publicKey,
+        queue: params.queue,
+        secpAuthority: null,
+        sourceOracleKey: params.sourceOracleKey,
+      },
+      {
+        accounts: {
+          oracle: oracle,
+          oracleStats,
+          authority: payer.publicKey,
+          programState: stateKey,
+          payer: payer.publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: spl.TOKEN_PROGRAM_ID,
+          tokenMint: spl.NATIVE_MINT,
+          delegationPool,
+          lutSigner,
+          lut,
+          addressLookupTableProgram: AddressLookupTableProgram.programId,
+          switchMint: state.switchMint,
+          wsolVault: spl.getAssociatedTokenAddressSync(
+            spl.NATIVE_MINT,
+            oracle,
+            true
+          ),
+          switchVault: spl.getAssociatedTokenAddressSync(
+            state.switchMint,
+            oracle,
+            true
+          ),
+          stakeProgram: state.stakeProgram,
+          stakePool: state.stakePool,
+        },
+      }
+    );
+
+    return [new Oracle(program, oracle), [ix]];
+  }
+
+  /**
+   * ATODO: wrap this one up with the gateway bridge oracle fn
+   * @param params
+   * @returns
+   */
+  static async quoteVerifySvmIx(
+    program: Program,
+    params: {
+      chain?: string; // Unused atm
+      network?: "mainnet" | "mainnet-beta" | "testnet" | "devnet";
+      queue: PublicKey; // Solana queue
+      attestee: PublicKey; // Solana attestee
+      attester: PublicKey; // Solana attester guardian we're requesting from
+    }
+  ): Promise<TransactionInstruction> {
+    // const [queuePDA, queueBump] = await PublicKey.findProgramAddress(
+    //   [Buffer.from("Queue"), params.queue.toBuffer()],
+    //   program.programId
+    // );
+
+    // timestamp handled by bridge fn
+    // mrEnclave handled by bridge fn
+    // secp256k1Key handled by bridge fn
+    // slot has to be handled by us I think
+    // signature has to be handled by bridge fn
+    // recoveryId has to be handled by bridge fn
+
+    // guardian key & oracle key
+
+    // source oracle key handled by us:
+
+    // source oracle queue key handled by us:
+
+    // source guardian queue key handled by us:
+
+    // const ix = await program.instruction.guardianQuoteVerifySvm(
+    //   {
+    //     timestamp: new anchor.BN(params.timestamp),
+    //     mrEnclave: params.mrEnclave, // 32-byte array
+    //     _reserved1: params._reserved1, // 32-bit unsigned integer
+    //     secp256k1Key: params.secp256k1Key, // 64-byte array
+    //     slot: new anchor.BN(params.slot), // Slot as u64
+    //     signature: params.signature, // 64-byte array
+    //     recoveryId: params.recoveryId, // u8
+    //     sourceOracleKey: params.sourceOracleKey, // Pubkey of source oracle
+    //     sourceOracleQueueKey: params.sourceOracleQueueKey, // Pubkey of oracle queue
+    //     sourceGuardianQueueKey: params.sourceGuardianQueueKey, // Pubkey of guardian queue
+    //     oracleBump: params.oracleBump, // Bump for oracle PDA
+    //     oracleQueueBump: params.oracleQueueBump, // Bump for oracle queue PDA
+    //     guardianQueueBump: params.guardianQueueBump, // Bump for guardian queue PDA
+    //   },
+    //   {
+    //     accounts: {
+    //       guardian: guardianAccountLoader, // AccountLoader for OracleAccountData
+    //       oracle: oracleAccountLoader, // AccountLoader for OracleAccountData
+    //       oracleStats: oracleStatsAccountLoader, // AccountLoader for OracleStatsAccountData
+    //       payer: payer.publicKey, // Signer for transaction
+    //       systemProgram: SystemProgram.programId, // System program ID
+    //       oracleQueue: oracleQueueAccountLoader, // AccountLoader for QueueAccountData
+    //       guardianQueue: guardianQueueAccountLoader, // AccountLoader for QueueAccountData
+    //       state: stateAccountLoader, // AccountLoader for State
+    //       recentSlothashes: anchor.web3.SYSVAR_SLOT_HASHES_PUBKEY, // Sysvar slot hashes
+    //       lutSigner: lutSignerAccount, // AccountInfo for lut signer
+    //       lut: lutAccount, // AccountInfo for lut (lookup table)
+    //       programState: programStateAccountLoader, // AccountLoader for State
+    //     },
+    //     signers: [payer], // Add payer as the signer for the instruction
+    //   }
+    // );
+
+    throw new Error("Quote verify SVM not implemented yet.");
+  }
+
   async updateDelegationRewardPoolsIx(params: {
     overrideStakePool?: PublicKey;
     overrideMint?: PublicKey;
@@ -197,12 +378,23 @@ export class Oracle {
       ],
       stakeProgram
     );
+    console.log("stakepool", stakePool.toBase58());
+    console.log("delegationPool", delegationPool.toBase58());
     const lutSlot = oracleData.lutSlot.toNumber();
     const [_, lut] = AddressLookupTableProgram.createLookupTable({
       authority: lutSigner,
       payer: payer.publicKey,
       recentSlot: lutSlot,
     });
+    const [delegationGroup] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("Group"),
+        stateKey.toBuffer(),
+        state.stakePool.toBuffer(),
+        oracleData.queue.toBuffer(),
+      ],
+      stakeProgram
+    );
     const ix = await program.instruction.oracleUpdateDelegation(
       {
         recentSlot: new BN(lutSlot.toString()),
@@ -241,6 +433,7 @@ export class Oracle {
           )[0],
           stakeProgram: stakeProgram,
           stakePool: stakePool,
+          delegationGroup,
         },
       }
     );

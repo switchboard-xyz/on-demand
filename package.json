@@ -1,6 +1,6 @@
 {
   "name": "@switchboard-xyz/on-demand",
-  "version": "1.2.22",
+  "version": "1.2.49",
   "description": "A Typescript client to interact with Switchboard On-Demand.",
   "license": "ISC",
   "main": "dist/cjs/index.js",
@@ -14,21 +14,23 @@
     "check-types": "tsc --noEmit",
     "docgen": "typedoc --out ./docs/ ./src",
     "docgen:deploy": "pnpm docgen && firebase deploy --project docs --only hosting:switchboard-docs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "prepack": "pnpm build",
+    "test": "pnpm exec jest --passWithNoTests"
   },
   "dependencies": {
+    "@brokerloop/ttlcache": "^3.2.3",
     "@coral-xyz/anchor-30": "npm:@coral-xyz/anchor@0.30.1",
     "@solana/web3.js": "^1.95.0",
     "@solworks/soltoolkit-sdk": "^0.0.23",
     "@switchboard-xyz/common": "workspace:^",
-    "axios": "^1.2.0",
+    "axios": "^1.7.4",
     "big.js": "^6.2.1",
     "bs58": "^5.0.0",
     "js-yaml": "^4.1.0",
-    "node-cache": "^5.1.2",
     "protobufjs": "^7.2.6"
   },
   "devDependencies": {
+    "jest": "^29.7.0",
     "typedoc": "^0.25.9",
     "typescript": "5.4.5"
   },

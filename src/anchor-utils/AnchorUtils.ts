@@ -1,4 +1,8 @@
-import { SB_ON_DEMAND_PID } from "./../constants.js";
+import {
+  isMainnetConnection,
+  ON_DEMAND_DEVNET_PID,
+  ON_DEMAND_MAINNET_PID,
+} from "../utils";
 
 import * as anchor from "@coral-xyz/anchor-30";
 import NodeWallet from "@coral-xyz/anchor-30/dist/cjs/nodewallet.js";
@@ -62,10 +66,12 @@ export class AnchorUtils {
    */
   static async loadProgramFromEnv(): Promise<anchor.Program> {
     const config = await AnchorUtils.loadEnv();
-    const idl = (await anchor.Program.fetchIdl(
-      SB_ON_DEMAND_PID,
-      config.provider
-    ))!;
+    const isMainnet = isMainnetConnection(config.connection);
+    let pid = ON_DEMAND_MAINNET_PID;
+    if (!isMainnet) {
+      pid = ON_DEMAND_DEVNET_PID;
+    }
+    const idl = (await anchor.Program.fetchIdl(pid, config.provider))!;
     const program = new anchor.Program(idl, config.provider);
     return new anchor.Program(idl, config.provider);
   }
@@ -117,10 +123,12 @@ export class AnchorUtils {
         commitment: "confirmed",
       }
     );
-    const idl = (await anchor.Program.fetchIdl(
-      SB_ON_DEMAND_PID,
-      config.provider
-    ))!;
+    const isMainnet = await isMainnetConnection(config.connection);
+    let pid = ON_DEMAND_MAINNET_PID;
+    if (!isMainnet) {
+      pid = ON_DEMAND_DEVNET_PID;
+    }
+    const idl = (await anchor.Program.fetchIdl(pid, config.provider))!;
     const program = new anchor.Program(idl, config.provider);
     config.program = program;
 

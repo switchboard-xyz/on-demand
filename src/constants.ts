@@ -20,10 +20,3 @@ export const SLOT_HASHES_SYSVAR_ID = new PublicKey(
 export const IX_SYSVAR_ID = new PublicKey(
   "Sysvar1nstructions1111111111111111111111111"
 );
-
-/**
- * The public key of the Solana Switchboard-On-Demand program.
- */
-export const SB_ON_DEMAND_PID = new PublicKey(
-  "SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv"
-);
