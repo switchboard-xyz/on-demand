@@ -65,6 +65,14 @@ export type FetchSignaturesMultiResponse = {
     oracle_responses: FeedEvalManyResponse[];
     errors: string[];
 };
+export type FeedEvalBatchResponse = {
+    feed_responses: FeedEvalResponse[];
+    errors: string[];
+};
+export type FetchSignaturesBatchResponse = {
+    oracle_responses: FeedEvalBatchResponse[];
+    errors: string[];
+};
 /**
  *  The response from the gateway after revealing randomness.
  *  Variables are snake_case for serialization.
@@ -303,22 +311,6 @@ export declare class Gateway {
         get_for_guardian: boolean;
     }): Promise<FetchQuoteResponse[]>;
     /**
-     * Sends a request to the gateway bridge enclave.
-     *
-     * REST API endpoint: /api/v1/gateway_bridge_enclave
-     *
-     * @param chainHash The chain hash to include in the request.
-     * @param oraclePubkey The public key of the oracle.
-     * @param queuePubkey The public key of the queue.
-     * @returns A promise that resolves to the response.
-     * @throws if the request fails.
-     */
-    fetchBridgingMessage(params: {
-        chainHash: string;
-        oraclePubkey: string;
-        queuePubkey: string;
-    }): Promise<BridgeEnclaveResponse>;
-    /**
      *  Fetches signatures from the gateway.
      *
      *  REST API endpoint: /api/v1/fetch_signatures
@@ -359,6 +351,60 @@ export declare class Gateway {
         numSignatures: number;
         useTimestamp?: boolean;
     }): Promise<FetchSignaturesMultiResponse>;
+    /**
+     * Fetches signatures from the gateway without pre-encoded jobs
+     * REST API endpoint: /api/v1/fetch_signatures_batch
+     *
+     * @param recentHash The chain metadata to sign with. Blockhash or slothash.
+     * @param feedConfigs The feed configurations to fetch signatures for.
+     * @param numSignatures The number of oracles to fetch signatures from.
+     * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+     * @returns A promise that resolves to the feed evaluation responses.
+     * @throws if the request fails.
+     */
+    fetchSignaturesBatch(params: {
+        recentHash?: string;
+        feedConfigs: FeedRequest[];
+        numSignatures?: number;
+        useTimestamp?: boolean;
+    }): Promise<FetchSignaturesBatchResponse>;
+    /**
+     * Fetches signatures from the gateway.
+     * REST API endpoint: /api/v1/fetch_signatures_batch
+     *
+     * @param recentHash The chain metadata to sign with. Blockhash or slothash.
+     * @param encodedConfigs The encoded feed configurations to fetch signatures for.
+     * @param numSignatures The number of oracles to fetch signatures from.
+     * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+     * @returns A promise that resolves to the feed evaluation responses.
+     * @throws if the request fails.
+     */
+    fetchSignaturesFromEncodedBatch(params: {
+        recentHash?: string;
+        encodedConfigs: {
+            encodedJobs: string[];
+            maxVariance: number;
+            minResponses: number;
+        }[];
+        numSignatures: number;
+        useTimestamp?: boolean;
+    }): Promise<FetchSignaturesBatchResponse>;
+    /**
+     * Sends a request to the gateway bridge enclave.
+     *
+     * REST API endpoint: /api/v1/gateway_bridge_enclave
+     *
+     * @param chainHash The chain hash to include in the request.
+     * @param oraclePubkey The public key of the oracle.
+     * @param queuePubkey The public key of the queue.
+     * @returns A promise that resolves to the response.
+     * @throws if the request fails.
+     */
+    fetchBridgingMessage(params: {
+        chainHash: string;
+        oraclePubkey: string;
+        queuePubkey: string;
+    }): Promise<BridgeEnclaveResponse>;
     /**
      * Fetches the randomness reveal from the gateway.
      * @param params The parameters for the randomness reveal.

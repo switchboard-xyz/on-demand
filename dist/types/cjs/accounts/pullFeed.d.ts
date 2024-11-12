@@ -1,5 +1,6 @@
 /// <reference types="node" />
-import type { FeedEvalResponse } from "../oracle-interfaces/gateway.js";
+/// <reference types="node" />
+import type { FeedEvalResponse, FetchSignaturesMultiResponse } from "../oracle-interfaces/gateway.js";
 import { Oracle } from "./oracle.js";
 import type { Program } from "@coral-xyz/anchor-30";
 import * as anchor from "@coral-xyz/anchor-30";
@@ -21,6 +22,11 @@ export interface CurrentResult {
     minSlot: BN;
     maxSlot: BN;
 }
+export interface CompactResult {
+    stdDev: number;
+    mean: number;
+    slot: BN;
+}
 export interface OracleSubmission {
     oracle: PublicKey;
     slot: BN;
@@ -30,29 +36,33 @@ export interface PullFeedAccountData {
     submissions: OracleSubmission[];
     authority: PublicKey;
     queue: PublicKey;
-    feedHash: Buffer;
+    feedHash: Uint8Array;
     initializedAt: BN;
     permissions: BN;
     maxVariance: BN;
     minResponses: number;
-    name: Buffer;
+    name: Uint8Array;
     sampleSize: number;
     lastUpdateTimestamp: BN;
     lutSlot: BN;
     result: CurrentResult;
     maxStaleness: number;
     minSampleSize: number;
+    historicalResultIdx: number;
+    historicalResults: CompactResult[];
 }
 export type MultiSubmission = {
     values: anchor.BN[];
     signature: Buffer;
     recoveryId: number;
 };
-export type OracleResponse = {
-    oracle: Oracle;
-    value: Big | null;
-    error: string;
-};
+export declare class OracleResponse {
+    readonly oracle: Oracle;
+    readonly value: Big | null;
+    readonly error: string;
+    constructor(oracle: Oracle, value: Big | null, error: string);
+    shortError(): string | undefined;
+}
 export type FeedRequest = {
     maxVariance: number;
     minResponses: number;
@@ -104,6 +114,7 @@ export declare class PullFeed {
     } | {
         jobs: IOracleJob[];
     })): Promise<[PullFeed, VersionedTransaction]>;
+    private getPayer;
     /**
      *  Calls to initialize a pull feed account and to update the configuration account need to
      *  compute the feed hash for the account (if one is not specified).
@@ -183,11 +194,14 @@ export declare class PullFeed {
         jobs?: IOracleJob[];
         crossbarClient?: CrossbarClient;
         retries?: number;
-    }, recentSlothashes?: Array<[anchor.BN, string]>, priceSignatures?: FeedEvalResponse[], debug?: boolean): Promise<[
+        chain?: string;
+        network?: "mainnet" | "mainnet-beta" | "testnet" | "devnet";
+        solanaRpcUrl?: string;
+    }, recentSlothashes?: Array<[anchor.BN, string]>, priceSignatures?: FeedEvalResponse[], debug?: boolean, payer?: PublicKey): Promise<[
         TransactionInstruction | undefined,
         OracleResponse[],
         number,
-        any[],
+        AddressLookupTableAccount[],
         string[]
     ]>;
     /**
@@ -207,6 +221,7 @@ export declare class PullFeed {
      *
      * @param params_ - The parameters object.
      * @param params_.gateway - Optionally specify the gateway to use. If not specified, the gateway is automatically fetched.
+     * @param params._chain - Optionally specify the chain to use. If not specified, Solana is used.
      * @param params_.numSignatures - Number of signatures to fetch.
      * @param params_.feedConfigs - Optionally specify the feed configs. If not specified, the feed configs are automatically fetched.
      * @param params_.jobs - An array of `IOracleJob` representing the jobs to be executed.
@@ -223,6 +238,9 @@ export declare class PullFeed {
      */
     static fetchUpdateIx(program: Program, params_: {
         gateway?: string;
+        chain?: string;
+        network?: "mainnet" | "mainnet-beta" | "testnet" | "devnet";
+        solanaRpcUrl?: string;
         queue: PublicKey;
         feed: PublicKey;
         numSignatures: number;
@@ -234,11 +252,11 @@ export declare class PullFeed {
         TransactionInstruction | undefined,
         OracleResponse[],
         number,
-        any[],
+        AddressLookupTableAccount[],
         string[]
     ]>;
     /**
-     * Fetches updates for multiple feeds at once.
+     * Fetches updates for multiple feeds at once into SEPARATE intructions (one for each)
      *
      * @param program - The Anchor program instance.
      * @param params_ - The parameters object.
@@ -254,13 +272,62 @@ export declare class PullFeed {
      * - An array of `AddressLookupTableAccount` to use.
      * - The raw response data.
      */
+    static fetchUpdateManyIxs(program: Program, params_: {
+        gateway?: string;
+        feeds: PublicKey[];
+        numSignatures: number;
+        crossbarClient?: CrossbarClient;
+        payer?: PublicKey;
+    }, recentSlothashes?: Array<[anchor.BN, string]>, debug?: boolean, payer?: PublicKey): Promise<{
+        successes: {
+            submitSignaturesIx: TransactionInstruction;
+            oracleResponses: {
+                value: Big.Big;
+                error: string;
+                oracle: Oracle;
+            };
+            numSuccesses: number;
+            luts: AddressLookupTableAccount[];
+            failures: string[];
+        }[];
+        failures: {
+            feed: PublicKey;
+            error: string;
+        }[];
+    }>;
+    /**
+     * Prefetch all lookup tables needed for the feed and queue.
+     * @returns A promise that resolves to an array of lookup tables.
+     * @throws if the lookup tables cannot be loaded.
+     */
+    preHeatLuts(): Promise<AddressLookupTableAccount[]>;
+    /**
+     * Fetches updates for multiple feeds at once into a SINGLE tightly packed intruction
+     *
+     * @param program - The Anchor program instance.
+     * @param params_ - The parameters object.
+     * @param params_.gateway - The gateway URL to use. If not provided, the gateway is automatically fetched.
+     * @param params_.feeds - An array of feed account public keys.
+     * @param params_.numSignatures - The number of signatures to fetch.
+     * @param params_.crossbarClient - Optionally specify the CrossbarClient to use.
+     * @param recentSlothashes - An optional array of recent slothashes as `[anchor.BN, string]` tuples.
+     * @param debug - A boolean flag to enable or disable debug mode. Defaults to `false`.
+     * @returns A promise that resolves to a tuple containing:
+     * - The transaction instruction for fetching updates.
+     * - An array of `AddressLookupTableAccount` to use.
+     * - The raw response data.
+     */
     static fetchUpdateManyIx(program: Program, params_: {
         gateway?: string;
         feeds: PublicKey[];
         numSignatures: number;
         crossbarClient?: CrossbarClient;
         payer?: PublicKey;
-    }, recentSlothashes?: Array<[anchor.BN, string]>, debug?: boolean, payer?: PublicKey): Promise<[TransactionInstruction, AddressLookupTableAccount[], any]>;
+    }, recentSlothashes?: Array<[anchor.BN, string]>, debug?: boolean): Promise<[
+        TransactionInstruction,
+        AddressLookupTableAccount[],
+        FetchSignaturesMultiResponse
+    ]>;
     /**
      *  Compiles a transaction instruction to submit oracle signatures for a given feed.
      *
@@ -273,6 +340,7 @@ export declare class PullFeed {
         offsets: number[];
         slot: anchor.BN;
         payer?: PublicKey;
+        chain?: string;
     }): TransactionInstruction;
     /**
      *  Checks if the pull feed account has been initialized.
@@ -330,5 +398,6 @@ export declare class PullFeed {
     }]) => Promise<void>): Promise<number>;
     lookupTableKey(data: any): PublicKey;
     loadLookupTable(): Promise<AddressLookupTableAccount>;
+    loadHistoricalValuesCompact(data_?: PullFeedAccountData): Promise<CompactResult[]>;
 }
 //# sourceMappingURL=pullFeed.d.ts.map

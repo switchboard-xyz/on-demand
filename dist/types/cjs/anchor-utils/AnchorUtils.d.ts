@@ -1,4 +1,5 @@
 import * as anchor from "@coral-xyz/anchor-30";
+import NodeWallet from "@coral-xyz/anchor-30/dist/cjs/nodewallet.js";
 import type { Commitment } from "@solana/web3.js";
 import { Connection, Keypair } from "@solana/web3.js";
 type SolanaConfig = {
@@ -9,7 +10,7 @@ type SolanaConfig = {
     keypair: Keypair;
     connection: Connection;
     provider: anchor.AnchorProvider;
-    wallet: anchor.Wallet;
+    wallet: NodeWallet;
     program: anchor.Program | null;
 };
 export declare class AnchorUtils {
@@ -17,9 +18,9 @@ export declare class AnchorUtils {
      * Initializes a wallet from a file.
      *
      * @param {string} filePath - The path to the file containing the wallet's secret key.
-     * @returns {Promise<[anchor.Wallet, Keypair]>} A promise that resolves to a tuple containing the wallet and the keypair.
+     * @returns {Promise<[NodeWallet, Keypair]>} A promise that resolves to a tuple containing the wallet and the keypair.
      */
-    static initWalletFromFile(filePath: string): Promise<[anchor.Wallet, Keypair]>;
+    static initWalletFromFile(filePath: string): Promise<[NodeWallet, Keypair]>;
     /**
      * Initializes a keypair from a file.
      *

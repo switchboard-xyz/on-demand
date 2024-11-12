@@ -11,8 +11,4 @@ export declare const SLOT_HASHES_SYSVAR_ID: PublicKey;
  * The public key of the Solana Instructions sysvar.
  */
 export declare const IX_SYSVAR_ID: PublicKey;
-/**
- * The public key of the Solana Switchboard-On-Demand program.
- */
-export declare const SB_ON_DEMAND_PID: PublicKey;
 //# sourceMappingURL=constants.d.ts.map

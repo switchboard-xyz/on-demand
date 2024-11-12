@@ -22,6 +22,32 @@ export declare class Oracle {
     static create(program: Program, params: {
         queue: PublicKey;
     }): Promise<[Oracle, TransactionInstruction[], Keypair]>;
+    /**
+     * Creates a new oracle account for SVM chains (non-solana). linked to the specified queue.
+     * After creation the oracle still must receive run approval and verify their
+     * enclave measurement.
+     * @param program - The program that owns the oracle account.
+     * @param params.queue - The queue that the oracle will be linked to.
+     * @returns A promise that resolves to a tuple containing the oracle account
+     * and the transaction signature.
+     *
+     */
+    static createSVM(program: Program, params: {
+        queue: PublicKey;
+        sourceOracleKey: PublicKey;
+    }): Promise<[Oracle, TransactionInstruction[]]>;
+    /**
+     * ATODO: wrap this one up with the gateway bridge oracle fn
+     * @param params
+     * @returns
+     */
+    static quoteVerifySvmIx(program: Program, params: {
+        chain?: string;
+        network?: "mainnet" | "mainnet-beta" | "testnet" | "devnet";
+        queue: PublicKey;
+        attestee: PublicKey;
+        attester: PublicKey;
+    }): Promise<TransactionInstruction>;
     updateDelegationRewardPoolsIx(params: {
         overrideStakePool?: PublicKey;
         overrideMint?: PublicKey;

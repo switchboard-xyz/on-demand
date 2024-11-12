@@ -75,7 +75,7 @@ export class State {
      */
     setConfigsIx(params) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+            var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m;
             const state = yield this.loadData();
             const queue = (_a = params.guardianQueue) !== null && _a !== void 0 ? _a : state.guardianQueue;
             const program = this.program;
@@ -95,6 +95,8 @@ export class State {
                 switchMint: (_h = params.switchMint) !== null && _h !== void 0 ? _h : state.switchMint,
                 enableStaking: (_j = params.enableStaking) !== null && _j !== void 0 ? _j : state.enableStaking,
                 authority: (_k = params.newAuthority) !== null && _k !== void 0 ? _k : state.authority,
+                addCostWl: (_l = params.addCostWl) !== null && _l !== void 0 ? _l : PublicKey.default,
+                rmCostWl: (_m = params.rmCostWl) !== null && _m !== void 0 ? _m : PublicKey.default,
             }, {
                 accounts: {
                     state: this.pubkey,

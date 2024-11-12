@@ -67,15 +67,14 @@ export class Randomness {
      */
     static create(program, kp, queue, payer_) {
         return __awaiter(this, void 0, void 0, function* () {
-            const payer = payer_ !== null && payer_ !== void 0 ? payer_ : program.provider.wallet.payer;
             const lutSigner = (yield PublicKey.findProgramAddress([Buffer.from("LutSigner"), kp.publicKey.toBuffer()], program.programId))[0];
             const recentSlot = yield program.provider.connection.getSlot("finalized");
             const [_, lut] = AddressLookupTableProgram.createLookupTable({
                 authority: lutSigner,
-                payer: payer.publicKey,
+                payer: PublicKey.default,
                 recentSlot,
             });
-            const ix = yield program.instruction.randomnessInit({
+            const ix = program.instruction.randomnessInit({
                 recentSlot: new anchor.BN(recentSlot.toString()),
             }, {
                 accounts: {
@@ -324,17 +323,16 @@ export class Randomness {
     static createAndCommitIxs(program, queue) {
         return __awaiter(this, void 0, void 0, function* () {
             const kp = Keypair.generate();
-            const payer = program.provider.wallet.payer;
             const lutSigner = (yield PublicKey.findProgramAddress([Buffer.from("LutSigner"), kp.publicKey.toBuffer()], program.programId))[0];
             const recentSlot = yield program.provider.connection.getSlot("finalized");
             const [_, lut] = AddressLookupTableProgram.createLookupTable({
                 authority: lutSigner,
-                payer: payer.publicKey,
+                payer: PublicKey.default,
                 recentSlot,
             });
             const queueAccount = new Queue(program, queue);
             const oracle = yield queueAccount.fetchFreshOracle();
-            const creationIx = yield program.instruction.randomnessInit({}, {
+            const creationIx = program.instruction.randomnessInit({}, {
                 accounts: {
                     randomness: kp.publicKey,
                     queue,

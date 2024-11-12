@@ -60,6 +60,8 @@ export declare class State {
         epochLength?: BN;
         resetEpochs?: boolean;
         enableStaking?: boolean;
+        addCostWl?: PublicKey;
+        rmCostWl?: PublicKey;
     }): Promise<TransactionInstruction>;
     /**
      * Register a guardian with the global guardian queue.

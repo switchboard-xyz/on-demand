@@ -1,8 +1,10 @@
 /// <reference types="node" />
-import type { FeedEvalResponse, FetchSignaturesMultiResponse } from "../oracle-interfaces/gateway.js";
+/// <reference types="node" />
+import type { FeedEvalResponse, FetchSignaturesBatchResponse, FetchSignaturesMultiResponse } from "../oracle-interfaces/gateway.js";
 import { Gateway } from "../oracle-interfaces/gateway.js";
 import type { SwitchboardPermission } from "./permission.js";
 import type { FeedRequest } from "./pullFeed.js";
+import * as anchor from "@coral-xyz/anchor-30";
 import { type Program } from "@coral-xyz/anchor-30";
 import type { AddressLookupTableAccount, TransactionInstruction } from "@solana/web3.js";
 import { Keypair, PublicKey } from "@solana/web3.js";
@@ -24,6 +26,34 @@ export declare class Queue {
         nodeTimeout?: number;
         lutSlot?: number;
     }): Promise<[Queue, Keypair, TransactionInstruction]>;
+    /**
+     * Creates a new instance of the `Queue` account with a PDA for SVM (non-solana) chains.
+     * @param program The anchor program instance.
+     * @param params The initialization parameters for the queue.
+     * @returns
+     */
+    static createIxSVM(program: Program, params: {
+        sourceQueueKey: PublicKey;
+        allowAuthorityOverrideAfter?: number;
+        requireAuthorityHeartbeatPermission?: boolean;
+        requireUsagePermission?: boolean;
+        maxQuoteVerificationAge?: number;
+        reward?: number;
+        nodeTimeout?: number;
+        lutSlot?: number;
+    }): Promise<[Queue, TransactionInstruction]>;
+    /**
+     * Add an Oracle to a queue and set permissions
+     * @param program
+     * @param params
+     */
+    overrideSVM(params: {
+        oracle: PublicKey;
+        secp256k1Signer: Buffer;
+        maxQuoteVerificationAge: number;
+        mrEnclave: Buffer;
+        slot: number;
+    }): Promise<anchor.web3.TransactionInstruction>;
     initDelegationGroupIx(params: {
         lutSlot?: number;
         overrideStakePool?: PublicKey;
@@ -58,6 +88,13 @@ export declare class Queue {
         feedConfigs: FeedRequest[];
         minResponses?: number;
     }): Promise<FetchSignaturesMultiResponse>;
+    static fetchSignaturesBatch(program: Program, params: {
+        gateway?: string;
+        queue: PublicKey;
+        recentHash?: string;
+        feedConfigs: FeedRequest[];
+        minResponses?: number;
+    }): Promise<FetchSignaturesBatchResponse>;
     /**
      * @deprecated
      * Deprecated. Use {@linkcode @switchboard-xyz/common#FeedHash.compute} instead.
@@ -104,6 +141,8 @@ export declare class Queue {
      *  @param recentHash The chain metadata to sign with. Blockhash or slothash.
      *  @param jobs The oracle jobs to perform.
      *  @param numSignatures The number of oracles to fetch signatures from.
+     *  @param maxVariance The maximum variance allowed in the responses.
+     *  @param minResponses The minimum number of responses to attempt to fetch.
      *  @returns A promise that resolves to the feed evaluation responses.
      *  @throws if the request fails.
      */
@@ -114,6 +153,7 @@ export declare class Queue {
         numSignatures?: number;
         maxVariance?: number;
         minResponses?: number;
+        chain?: string;
     }): Promise<{
         responses: FeedEvalResponse[];
         failures: string[];
@@ -125,6 +165,13 @@ export declare class Queue {
         feedConfigs: FeedRequest[];
         minResponses?: number;
     }): Promise<FetchSignaturesMultiResponse>;
+    fetchSignaturesBatch(params: {
+        gateway?: string;
+        queue: PublicKey;
+        recentHash?: string;
+        feedConfigs: FeedRequest[];
+        minResponses?: number;
+    }): Promise<FetchSignaturesBatchResponse>;
     /**
      *  Loads the queue data for this {@linkcode Queue} account from on chain.
      *
@@ -191,6 +238,18 @@ export declare class Queue {
      *  @throws if the request fails.
      */
     fetchFreshOracle(): Promise<PublicKey>;
+    /**
+     * Get the PDA for the queue (SVM chains that are not solana)
+     * @returns Queue PDA Pubkey
+     */
+    queuePDA(): PublicKey;
+    /**
+     * Get the PDA for the queue (SVM chains that are not solana)
+     * @param program Anchor program
+     * @param pubkey Queue pubkey
+     * @returns Queue PDA Pubkey
+     */
+    static queuePDA(program: Program, pubkey: PublicKey): PublicKey;
     lutSigner(): Promise<PublicKey>;
     lutKey(lutSlot: number): Promise<PublicKey>;
     loadLookupTable(): Promise<AddressLookupTableAccount>;

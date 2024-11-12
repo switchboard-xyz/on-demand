@@ -36,28 +36,24 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Gateway = void 0;
+const ttlcache_1 = require("@brokerloop/ttlcache");
 const common_1 = require("@switchboard-xyz/common");
 const axios_1 = __importDefault(require("axios"));
 const bs58 = __importStar(require("bs58"));
-const https_1 = require("https");
-const node_cache_1 = __importDefault(require("node-cache"));
-const GATEWAY_PING_CACHE = new node_cache_1.default({ stdTTL: 100, checkperiod: 120 });
-function newAbortSignal(timeoutMs) {
-    const abortController = new AbortController();
-    setTimeout(() => abortController.abort(), timeoutMs);
-    return abortController.signal;
-}
-const httpsAgent = new https_1.Agent({
-    rejectUnauthorized: false, // WARNING: This disables SSL/TLS certificate verification.
+const GATEWAY_PING_CACHE = new ttlcache_1.TTLCache({
+    ttl: 100,
+    max: 50,
+    clock: Date,
 });
+// const httpsAgent = new HttpsAgent({
+//   rejectUnauthorized: false, // WARNING: This disables SSL/TLS certificate verification.
+// });
 const TIMEOUT = 10000;
 const axiosClient = (() => {
     let instance;
     return () => {
         if (!instance) {
-            instance = axios_1.default.create({
-                httpsAgent,
-            });
+            instance = axios_1.default.create();
         }
         return instance;
     };
@@ -66,7 +62,11 @@ const axiosClient = (() => {
  *  base64 encodes an array of oracle jobs. to send to a gateway
  */
 function encodeJobs(jobArray) {
-    return jobArray.map((job) => Buffer.from(common_1.OracleJob.encodeDelimited(job).finish()).toString("base64"));
+    return jobArray.map((job) => {
+        const encoded = common_1.OracleJob.encodeDelimited(common_1.OracleJob.fromObject(job)).finish();
+        // const decoded = OracleJob.decodeDelimited(encoded);
+        return Buffer.from(encoded).toString("base64");
+    });
 }
 /**
  *  The gateway class is used to interface with the switchboard gateway REST API.
@@ -198,36 +198,6 @@ class Gateway {
             }));
         });
     }
-    /**
-     * Sends a request to the gateway bridge enclave.
-     *
-     * REST API endpoint: /api/v1/gateway_bridge_enclave
-     *
-     * @param chainHash The chain hash to include in the request.
-     * @param oraclePubkey The public key of the oracle.
-     * @param queuePubkey The public key of the queue.
-     * @returns A promise that resolves to the response.
-     * @throws if the request fails.
-     */
-    fetchBridgingMessage(params) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const api_version = "1.0.0";
-            const url = `${this.gatewayUrl}/gateway/api/v1/gateway_bridge_enclave`;
-            const method = "POST";
-            const headers = { "Content-Type": "application/json" };
-            const body = JSON.stringify({
-                api_version,
-                chain_hash: params.chainHash,
-                oracle_pubkey: params.oraclePubkey,
-                queue_pubkey: params.queuePubkey,
-            });
-            return axiosClient()
-                .post(url, body, { method, headers, timeout: TIMEOUT })
-                .then((r) => {
-                return r.data;
-            });
-        });
-    }
     // alberthermida@Switchboard ts % curl -X POST \
     // -H "Content-Type: application/json" \
     // -d '{
@@ -324,6 +294,119 @@ class Gateway {
             catch (err) {
                 console.error("fetchSignaturesFromEncodedMulti error", err);
                 throw err;
+            }
+        });
+    }
+    /**
+     * Fetches signatures from the gateway without pre-encoded jobs
+     * REST API endpoint: /api/v1/fetch_signatures_batch
+     *
+     * @param recentHash The chain metadata to sign with. Blockhash or slothash.
+     * @param feedConfigs The feed configurations to fetch signatures for.
+     * @param numSignatures The number of oracles to fetch signatures from.
+     * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+     * @returns A promise that resolves to the feed evaluation responses.
+     * @throws if the request fails.
+     */
+    fetchSignaturesBatch(params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const { recentHash, feedConfigs, useTimestamp, numSignatures } = params;
+            const encodedConfigs = feedConfigs.map((config) => {
+                var _a, _b;
+                const encodedJobs = encodeJobs(config.jobs);
+                return {
+                    encodedJobs,
+                    maxVariance: (_a = config.maxVariance) !== null && _a !== void 0 ? _a : 1,
+                    minResponses: (_b = config.minResponses) !== null && _b !== void 0 ? _b : 1,
+                };
+            });
+            const res = yield this.fetchSignaturesFromEncodedBatch({
+                recentHash,
+                encodedConfigs,
+                numSignatures: numSignatures !== null && numSignatures !== void 0 ? numSignatures : 1,
+                useTimestamp,
+            });
+            return res;
+        });
+    }
+    /**
+     * Fetches signatures from the gateway.
+     * REST API endpoint: /api/v1/fetch_signatures_batch
+     *
+     * @param recentHash The chain metadata to sign with. Blockhash or slothash.
+     * @param encodedConfigs The encoded feed configurations to fetch signatures for.
+     * @param numSignatures The number of oracles to fetch signatures from.
+     * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+     * @returns A promise that resolves to the feed evaluation responses.
+     * @throws if the request fails.
+     */
+    fetchSignaturesFromEncodedBatch(params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b, _c;
+            const { recentHash, encodedConfigs, numSignatures } = params;
+            const url = `${this.gatewayUrl}/gateway/api/v1/fetch_signatures_batch`;
+            const method = "POST";
+            const headers = { "Content-Type": "application/json" };
+            const body = {
+                api_version: "1.0.0",
+                num_oracles: numSignatures,
+                recent_hash: recentHash !== null && recentHash !== void 0 ? recentHash : bs58.encode(Buffer.alloc(32, 0)),
+                signature_scheme: "Secp256k1",
+                hash_scheme: "Sha256",
+                feed_requests: [],
+            };
+            for (const config of encodedConfigs) {
+                const maxVariance = Math.floor(Number((_a = config.maxVariance) !== null && _a !== void 0 ? _a : 1) * 1e9);
+                body.feed_requests.push({
+                    jobs_b64_encoded: config.encodedJobs,
+                    max_variance: maxVariance,
+                    min_responses: (_b = config.minResponses) !== null && _b !== void 0 ? _b : 1,
+                    use_timestamp: (_c = params.useTimestamp) !== null && _c !== void 0 ? _c : false,
+                });
+            }
+            const data = JSON.stringify(body);
+            // get size of data
+            try {
+                const resp = yield axiosClient()(url, { method, headers, data }).then((r) => {
+                    return Object.assign({}, r.data);
+                });
+                return resp;
+            }
+            catch (err) {
+                console.error("fetchSignaturesFromEncodedBatch error", err);
+                throw err;
+            }
+        });
+    }
+    /**
+     * Sends a request to the gateway bridge enclave.
+     *
+     * REST API endpoint: /api/v1/gateway_bridge_enclave
+     *
+     * @param chainHash The chain hash to include in the request.
+     * @param oraclePubkey The public key of the oracle.
+     * @param queuePubkey The public key of the queue.
+     * @returns A promise that resolves to the response.
+     * @throws if the request fails.
+     */
+    fetchBridgingMessage(params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const url = `${this.gatewayUrl}/gateway/api/v1/gateway_bridge_enclave`;
+            const method = "POST";
+            const headers = { "Content-Type": "application/json" };
+            const body = {
+                api_version: "1.0.0",
+                chain_hash: params.chainHash,
+                oracle_pubkey: params.oraclePubkey,
+                queue_pubkey: params.queuePubkey,
+            };
+            const data = JSON.stringify(body);
+            try {
+                const resp = yield axiosClient()(url, { method, headers, data }).then((r) => r.data);
+                return resp;
+            }
+            catch (error) {
+                throw error;
             }
         });
     }

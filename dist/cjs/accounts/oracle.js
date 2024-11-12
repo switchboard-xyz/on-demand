@@ -144,6 +144,135 @@ class Oracle {
             return [new Oracle(program, oracle.publicKey), [ix, ix2], oracle];
         });
     }
+    /**
+     * Creates a new oracle account for SVM chains (non-solana). linked to the specified queue.
+     * After creation the oracle still must receive run approval and verify their
+     * enclave measurement.
+     * @param program - The program that owns the oracle account.
+     * @param params.queue - The queue that the oracle will be linked to.
+     * @returns A promise that resolves to a tuple containing the oracle account
+     * and the transaction signature.
+     *
+     */
+    static createSVM(program, params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const stateKey = state_js_1.State.keyFromSeed(program);
+            const state = yield state_js_1.State.loadData(program);
+            const payer = program.provider.wallet.payer;
+            // Generate the queue PDA for the given source queue key
+            const [oracle] = yield web3_js_1.PublicKey.findProgramAddress([
+                Buffer.from("Oracle"),
+                params.queue.toBuffer(),
+                params.sourceOracleKey.toBuffer(),
+            ], program.programId);
+            const oracleStats = (yield web3_js_1.PublicKey.findProgramAddress([Buffer.from("OracleStats"), oracle.toBuffer()], program.programId))[0];
+            const lutSigner = (yield web3_js_1.PublicKey.findProgramAddress([Buffer.from("LutSigner"), oracle.toBuffer()], program.programId))[0];
+            const [delegationPool] = yield web3_js_1.PublicKey.findProgramAddress([
+                Buffer.from("Delegation"),
+                stateKey.toBuffer(),
+                oracleStats.toBuffer(),
+                state.stakePool.toBuffer(),
+            ], state.stakeProgram);
+            const recentSlot = yield program.provider.connection.getSlot("finalized");
+            const [_, lut] = web3_js_1.AddressLookupTableProgram.createLookupTable({
+                authority: lutSigner,
+                payer: payer.publicKey,
+                recentSlot,
+            });
+            const [delegationGroup] = yield web3_js_1.PublicKey.findProgramAddress([
+                Buffer.from("Group"),
+                stateKey.toBuffer(),
+                state.stakePool.toBuffer(),
+                params.queue.toBuffer(),
+            ], state.stakeProgram);
+            const ix = program.instruction.oracleInitSvm({
+                recentSlot: new anchor_30_1.BN(recentSlot.toString()),
+                authority: payer.publicKey,
+                queue: params.queue,
+                secpAuthority: null,
+                sourceOracleKey: params.sourceOracleKey,
+            }, {
+                accounts: {
+                    oracle: oracle,
+                    oracleStats,
+                    authority: payer.publicKey,
+                    programState: stateKey,
+                    payer: payer.publicKey,
+                    systemProgram: web3_js_1.SystemProgram.programId,
+                    tokenProgram: spl.TOKEN_PROGRAM_ID,
+                    tokenMint: spl.NATIVE_MINT,
+                    delegationPool,
+                    lutSigner,
+                    lut,
+                    addressLookupTableProgram: web3_js_1.AddressLookupTableProgram.programId,
+                    switchMint: state.switchMint,
+                    wsolVault: spl.getAssociatedTokenAddressSync(spl.NATIVE_MINT, oracle, true),
+                    switchVault: spl.getAssociatedTokenAddressSync(state.switchMint, oracle, true),
+                    stakeProgram: state.stakeProgram,
+                    stakePool: state.stakePool,
+                },
+            });
+            return [new Oracle(program, oracle), [ix]];
+        });
+    }
+    /**
+     * ATODO: wrap this one up with the gateway bridge oracle fn
+     * @param params
+     * @returns
+     */
+    static quoteVerifySvmIx(program, params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // const [queuePDA, queueBump] = await PublicKey.findProgramAddress(
+            //   [Buffer.from("Queue"), params.queue.toBuffer()],
+            //   program.programId
+            // );
+            // timestamp handled by bridge fn
+            // mrEnclave handled by bridge fn
+            // secp256k1Key handled by bridge fn
+            // slot has to be handled by us I think
+            // signature has to be handled by bridge fn
+            // recoveryId has to be handled by bridge fn
+            // guardian key & oracle key
+            // source oracle key handled by us:
+            // source oracle queue key handled by us:
+            // source guardian queue key handled by us:
+            // const ix = await program.instruction.guardianQuoteVerifySvm(
+            //   {
+            //     timestamp: new anchor.BN(params.timestamp),
+            //     mrEnclave: params.mrEnclave, // 32-byte array
+            //     _reserved1: params._reserved1, // 32-bit unsigned integer
+            //     secp256k1Key: params.secp256k1Key, // 64-byte array
+            //     slot: new anchor.BN(params.slot), // Slot as u64
+            //     signature: params.signature, // 64-byte array
+            //     recoveryId: params.recoveryId, // u8
+            //     sourceOracleKey: params.sourceOracleKey, // Pubkey of source oracle
+            //     sourceOracleQueueKey: params.sourceOracleQueueKey, // Pubkey of oracle queue
+            //     sourceGuardianQueueKey: params.sourceGuardianQueueKey, // Pubkey of guardian queue
+            //     oracleBump: params.oracleBump, // Bump for oracle PDA
+            //     oracleQueueBump: params.oracleQueueBump, // Bump for oracle queue PDA
+            //     guardianQueueBump: params.guardianQueueBump, // Bump for guardian queue PDA
+            //   },
+            //   {
+            //     accounts: {
+            //       guardian: guardianAccountLoader, // AccountLoader for OracleAccountData
+            //       oracle: oracleAccountLoader, // AccountLoader for OracleAccountData
+            //       oracleStats: oracleStatsAccountLoader, // AccountLoader for OracleStatsAccountData
+            //       payer: payer.publicKey, // Signer for transaction
+            //       systemProgram: SystemProgram.programId, // System program ID
+            //       oracleQueue: oracleQueueAccountLoader, // AccountLoader for QueueAccountData
+            //       guardianQueue: guardianQueueAccountLoader, // AccountLoader for QueueAccountData
+            //       state: stateAccountLoader, // AccountLoader for State
+            //       recentSlothashes: anchor.web3.SYSVAR_SLOT_HASHES_PUBKEY, // Sysvar slot hashes
+            //       lutSigner: lutSignerAccount, // AccountInfo for lut signer
+            //       lut: lutAccount, // AccountInfo for lut (lookup table)
+            //       programState: programStateAccountLoader, // AccountLoader for State
+            //     },
+            //     signers: [payer], // Add payer as the signer for the instruction
+            //   }
+            // );
+            throw new Error("Quote verify SVM not implemented yet.");
+        });
+    }
     updateDelegationRewardPoolsIx(params) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a, _b;
@@ -163,12 +292,20 @@ class Oracle {
                 oracleStats.toBuffer(),
                 stakePool.toBuffer(),
             ], stakeProgram);
+            console.log("stakepool", stakePool.toBase58());
+            console.log("delegationPool", delegationPool.toBase58());
             const lutSlot = oracleData.lutSlot.toNumber();
             const [_, lut] = web3_js_1.AddressLookupTableProgram.createLookupTable({
                 authority: lutSigner,
                 payer: payer.publicKey,
                 recentSlot: lutSlot,
             });
+            const [delegationGroup] = yield web3_js_1.PublicKey.findProgramAddress([
+                Buffer.from("Group"),
+                stateKey.toBuffer(),
+                state.stakePool.toBuffer(),
+                oracleData.queue.toBuffer(),
+            ], stakeProgram);
             const ix = yield program.instruction.oracleUpdateDelegation({
                 recentSlot: new anchor_30_1.BN(lutSlot.toString()),
             }, {
@@ -199,6 +336,7 @@ class Oracle {
                     ], stakeProgram)[0],
                     stakeProgram: stakeProgram,
                     stakePool: stakePool,
+                    delegationGroup,
                 },
             });
             return ix;
@@ -282,12 +420,11 @@ class Oracle {
     }
     lutKey() {
         return __awaiter(this, void 0, void 0, function* () {
-            const payer = this.program.provider.wallet.payer;
             const data = yield this.loadData();
             const lutSigner = (yield web3_js_1.PublicKey.findProgramAddress([Buffer.from("LutSigner"), this.pubkey.toBuffer()], this.program.programId))[0];
             const [_, lutKey] = yield web3_js_1.AddressLookupTableProgram.createLookupTable({
                 authority: lutSigner,
-                payer: payer.publicKey,
+                payer: web3_js_1.PublicKey.default,
                 recentSlot: data.lutSlot,
             });
             return lutKey;

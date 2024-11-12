@@ -33,8 +33,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Queue = void 0;
-const constants_js_1 = require("../constants.js");
 const gateway_js_1 = require("../oracle-interfaces/gateway.js");
+const utils_1 = require("../utils");
 const spl = __importStar(require("./../utils/index.js"));
 const permission_js_1 = require("./permission.js");
 const state_js_1 = require("./state.js");
@@ -143,6 +143,107 @@ class Queue {
             return [new Queue(program, queue.publicKey), queue, ix];
         });
     }
+    /**
+     * Creates a new instance of the `Queue` account with a PDA for SVM (non-solana) chains.
+     * @param program The anchor program instance.
+     * @param params The initialization parameters for the queue.
+     * @returns
+     */
+    static createIxSVM(program, params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b, _c, _d, _e, _f, _g;
+            const stateKey = state_js_1.State.keyFromSeed(program);
+            const state = yield state_js_1.State.loadData(program);
+            // Generate the queue PDA for the given source queue key
+            const [queue] = yield web3_js_1.PublicKey.findProgramAddress([Buffer.from("Queue"), params.sourceQueueKey.toBuffer()], program.programId);
+            const allowAuthorityOverrideAfter = (_a = params.allowAuthorityOverrideAfter) !== null && _a !== void 0 ? _a : 60 * 60;
+            const requireAuthorityHeartbeatPermission = (_b = params.requireAuthorityHeartbeatPermission) !== null && _b !== void 0 ? _b : true;
+            const requireUsagePermission = (_c = params.requireUsagePermission) !== null && _c !== void 0 ? _c : false;
+            const maxQuoteVerificationAge = (_d = params.maxQuoteVerificationAge) !== null && _d !== void 0 ? _d : 60 * 60 * 24 * 7;
+            const reward = (_e = params.reward) !== null && _e !== void 0 ? _e : 1000000;
+            const nodeTimeout = (_f = params.nodeTimeout) !== null && _f !== void 0 ? _f : 300;
+            const payer = program.provider.wallet.payer;
+            // Prepare accounts for the transaction
+            const lutSigner = (yield web3_js_1.PublicKey.findProgramAddress([Buffer.from("LutSigner"), queue.toBuffer()], program.programId))[0];
+            const [delegationGroup] = yield web3_js_1.PublicKey.findProgramAddress([
+                Buffer.from("Group"),
+                stateKey.toBuffer(),
+                state.stakePool.toBuffer(),
+                queue.toBuffer(),
+            ], state.stakeProgram);
+            const recentSlot = (_g = params.lutSlot) !== null && _g !== void 0 ? _g : (yield program.provider.connection.getSlot("finalized"));
+            const [_, lut] = web3_js_1.AddressLookupTableProgram.createLookupTable({
+                authority: lutSigner,
+                payer: payer.publicKey,
+                recentSlot,
+            });
+            let stakePool = state.stakePool;
+            if (stakePool.equals(web3_js_1.PublicKey.default)) {
+                stakePool = payer.publicKey;
+            }
+            const queueAccount = new Queue(program, queue);
+            const ix = program.instruction.queueInitSvm({
+                allowAuthorityOverrideAfter,
+                requireAuthorityHeartbeatPermission,
+                requireUsagePermission,
+                maxQuoteVerificationAge,
+                reward,
+                nodeTimeout,
+                recentSlot: new anchor.BN(recentSlot),
+                sourceQueueKey: params.sourceQueueKey,
+            }, {
+                accounts: {
+                    queue: queue,
+                    queueEscrow: yield spl.getAssociatedTokenAddress(spl.NATIVE_MINT, queue, true),
+                    authority: payer.publicKey,
+                    payer: payer.publicKey,
+                    systemProgram: web3_js_1.SystemProgram.programId,
+                    tokenProgram: spl.TOKEN_PROGRAM_ID,
+                    nativeMint: spl.NATIVE_MINT,
+                    programState: state_js_1.State.keyFromSeed(program),
+                    lutSigner: yield queueAccount.lutSigner(),
+                    lut: yield queueAccount.lutKey(recentSlot),
+                    addressLookupTableProgram: web3_js_1.AddressLookupTableProgram.programId,
+                    delegationGroup,
+                    stakeProgram: state.stakeProgram,
+                    stakePool: stakePool,
+                    associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+                },
+                signers: [payer],
+            });
+            return [new Queue(program, queue), ix];
+        });
+    }
+    /**
+     * Add an Oracle to a queue and set permissions
+     * @param program
+     * @param params
+     */
+    overrideSVM(params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const stateKey = state_js_1.State.keyFromSeed(this.program);
+            const state = yield state_js_1.State.loadData(this.program);
+            const programAuthority = state.authority;
+            const { authority } = yield this.loadData();
+            if (!authority.equals(programAuthority)) {
+                throw new Error("Override failed: Invalid authority");
+            }
+            const ix = this.program.instruction.queueOverrideSvm({
+                secp256K1Signer: Array.from(params.secp256k1Signer),
+                maxQuoteVerificationAge: new anchor.BN(params.maxQuoteVerificationAge),
+                mrEnclave: params.mrEnclave,
+                slot: new anchor.BN(params.slot),
+            }, {
+                accounts: {
+                    queue: this.pubkey,
+                    oracle: params.oracle,
+                    authority,
+                    state: stateKey,
+                },
+            });
+            return ix;
+        });
+    }
     initDelegationGroupIx(params) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a, _b;
@@ -158,7 +259,12 @@ class Queue {
                 stakePool.toBuffer(),
                 this.pubkey.toBuffer(),
             ], state.stakeProgram);
-            const [queueEscrowSigner] = yield web3_js_1.PublicKey.findProgramAddress([Buffer.from("Signer"), this.pubkey.toBuffer()], constants_js_1.SB_ON_DEMAND_PID);
+            const isMainnet = (0, utils_1.isMainnetConnection)(this.program.provider.connection);
+            let pid = utils_1.ON_DEMAND_MAINNET_PID;
+            if (!isMainnet) {
+                pid = utils_1.ON_DEMAND_DEVNET_PID;
+            }
+            const [queueEscrowSigner] = yield web3_js_1.PublicKey.findProgramAddress([Buffer.from("Signer"), this.pubkey.toBuffer()], pid);
             const ix = yield this.program.instruction.queueInitDelegationGroup({}, {
                 accounts: {
                     queue: this.pubkey,
@@ -201,6 +307,12 @@ class Queue {
         return __awaiter(this, void 0, void 0, function* () {
             const queueAccount = new Queue(program, params.queue);
             return queueAccount.fetchSignaturesMulti(params);
+        });
+    }
+    static fetchSignaturesBatch(program, params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const queueAccount = new Queue(program, params.queue);
+            return queueAccount.fetchSignaturesBatch(params);
         });
     }
     /**
@@ -301,6 +413,8 @@ class Queue {
      *  @param recentHash The chain metadata to sign with. Blockhash or slothash.
      *  @param jobs The oracle jobs to perform.
      *  @param numSignatures The number of oracles to fetch signatures from.
+     *  @param maxVariance The maximum variance allowed in the responses.
+     *  @param minResponses The minimum number of responses to attempt to fetch.
      *  @returns A promise that resolves to the feed evaluation responses.
      *  @throws if the request fails.
      */
@@ -322,6 +436,16 @@ class Queue {
                 gateway = yield this.fetchGateway();
             }
             return yield gateway.fetchSignaturesMulti(params);
+        });
+    }
+    fetchSignaturesBatch(params) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            let gateway = new gateway_js_1.Gateway(this.program, (_a = params.gateway) !== null && _a !== void 0 ? _a : "");
+            if (params.gateway === undefined) {
+                gateway = yield this.fetchGateway();
+            }
+            return yield gateway.fetchSignaturesBatch(params);
         });
     }
     /**
@@ -464,8 +588,27 @@ class Queue {
             const now = Math.floor(+new Date() / 1000);
             const oracles = yield this.fetchOracleKeys();
             const oracleAccounts = yield anchor_30_1.utils.rpc.getMultipleAccounts(this.program.provider.connection, oracles);
+            const oracleUris = oracleAccounts
+                .map((x) => coder.decode("oracleAccountData", x.account.data))
+                .map((x) => String.fromCharCode(...x.gatewayUri))
+                .map((x) => removeTrailingNullBytes(x))
+                .filter((x) => x.length > 0);
+            const tests = [];
+            for (const i in oracleUris) {
+                const gw = new gateway_js_1.Gateway(this.program, oracleUris[i], oracles[i]);
+                tests.push(gw.test());
+            }
             const zip = [];
             for (let i = 0; i < oracles.length; i++) {
+                try {
+                    const isGood = yield withTimeout(tests[i], 2000);
+                    if (!isGood) {
+                        continue;
+                    }
+                }
+                catch (e) {
+                    console.log("Gateway Timeout", e);
+                }
                 zip.push({
                     data: coder.decode("oracleAccountData", oracleAccounts[i].account.data),
                     key: oracles[i],
@@ -477,6 +620,23 @@ class Queue {
             const chosen = validOracles[Math.floor(Math.random() * validOracles.length)];
             return chosen.key;
         });
+    }
+    /**
+     * Get the PDA for the queue (SVM chains that are not solana)
+     * @returns Queue PDA Pubkey
+     */
+    queuePDA() {
+        return Queue.queuePDA(this.program, this.pubkey);
+    }
+    /**
+     * Get the PDA for the queue (SVM chains that are not solana)
+     * @param program Anchor program
+     * @param pubkey Queue pubkey
+     * @returns Queue PDA Pubkey
+     */
+    static queuePDA(program, pubkey) {
+        const [queuePDA] = web3_js_1.PublicKey.findProgramAddressSync([Buffer.from("Queue"), pubkey.toBuffer()], program.programId);
+        return queuePDA;
     }
     lutSigner() {
         return __awaiter(this, void 0, void 0, function* () {

@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.SB_ON_DEMAND_PID = exports.IX_SYSVAR_ID = exports.SLOT_HASHES_SYSVAR_ID = exports.SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID = void 0;
+exports.IX_SYSVAR_ID = exports.SLOT_HASHES_SYSVAR_ID = exports.SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID = void 0;
 const web3_js_1 = require("@solana/web3.js");
 /**
  * The public key of the Solana SPL Associated Token Account program.
@@ -14,8 +14,4 @@ exports.SLOT_HASHES_SYSVAR_ID = new web3_js_1.PublicKey("SysvarS1otHashes1111111
  * The public key of the Solana Instructions sysvar.
  */
 exports.IX_SYSVAR_ID = new web3_js_1.PublicKey("Sysvar1nstructions1111111111111111111111111");
-/**
- * The public key of the Solana Switchboard-On-Demand program.
- */
-exports.SB_ON_DEMAND_PID = new web3_js_1.PublicKey("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
 //# sourceMappingURL=constants.js.map

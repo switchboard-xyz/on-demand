@@ -7,8 +7,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-import { SB_ON_DEMAND_PID } from "./../constants.js";
+import { isMainnetConnection, ON_DEMAND_DEVNET_PID, ON_DEMAND_MAINNET_PID, } from "../utils";
 import * as anchor from "@coral-xyz/anchor-30";
+import NodeWallet from "@coral-xyz/anchor-30/dist/cjs/nodewallet.js";
 import { Connection, Keypair } from "@solana/web3.js";
 import * as fs from "fs";
 import yaml from "js-yaml";
@@ -25,12 +26,12 @@ export class AnchorUtils {
      * Initializes a wallet from a file.
      *
      * @param {string} filePath - The path to the file containing the wallet's secret key.
-     * @returns {Promise<[anchor.Wallet, Keypair]>} A promise that resolves to a tuple containing the wallet and the keypair.
+     * @returns {Promise<[NodeWallet, Keypair]>} A promise that resolves to a tuple containing the wallet and the keypair.
      */
     static initWalletFromFile(filePath) {
         return __awaiter(this, void 0, void 0, function* () {
             const keypair = yield AnchorUtils.initKeypairFromFile(filePath);
-            const wallet = new anchor.Wallet(keypair);
+            const wallet = new NodeWallet(keypair);
             return [wallet, keypair];
         });
     }
@@ -56,7 +57,12 @@ export class AnchorUtils {
     static loadProgramFromEnv() {
         return __awaiter(this, void 0, void 0, function* () {
             const config = yield AnchorUtils.loadEnv();
-            const idl = (yield anchor.Program.fetchIdl(SB_ON_DEMAND_PID, config.provider));
+            const isMainnet = isMainnetConnection(config.connection);
+            let pid = ON_DEMAND_MAINNET_PID;
+            if (!isMainnet) {
+                pid = ON_DEMAND_DEVNET_PID;
+            }
+            const idl = (yield anchor.Program.fetchIdl(pid, config.provider));
             const program = new anchor.Program(idl, config.provider);
             return new anchor.Program(idl, config.provider);
         });
@@ -80,20 +86,25 @@ export class AnchorUtils {
                 commitment: data.commitment,
                 keypair: data.keypair_path,
                 connection: defaultCon,
-                provider: new anchor.AnchorProvider(defaultCon, new anchor.Wallet(defaultKeypair), {}),
-                wallet: new anchor.Wallet(defaultKeypair),
+                provider: new anchor.AnchorProvider(defaultCon, new NodeWallet(defaultKeypair), {}),
+                wallet: new NodeWallet(defaultKeypair),
                 program: null,
             };
             config.keypair = (yield AnchorUtils.initWalletFromFile(config.keypairPath))[1];
             config.connection = new Connection(config.rpcUrl, {
                 commitment: "confirmed",
             });
-            config.wallet = new anchor.Wallet(config.keypair);
+            config.wallet = new NodeWallet(config.keypair);
             config.provider = new anchor.AnchorProvider(config.connection, config.wallet, {
                 preflightCommitment: "confirmed",
                 commitment: "confirmed",
             });
-            const idl = (yield anchor.Program.fetchIdl(SB_ON_DEMAND_PID, config.provider));
+            const isMainnet = yield isMainnetConnection(config.connection);
+            let pid = ON_DEMAND_MAINNET_PID;
+            if (!isMainnet) {
+                pid = ON_DEMAND_DEVNET_PID;
+            }
+            const idl = (yield anchor.Program.fetchIdl(pid, config.provider));
             const program = new anchor.Program(idl, config.provider);
             config.program = program;
             return config;
