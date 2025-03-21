@@ -7,7 +7,7 @@
 </div>
 
 # Switchboard On-Demand
-See the full documentation at [Switchboard On-Demand Documentation](https://switchboard-labs.gitbook.io/switchboard-on-demand/)
+See the full documentation at [Switchboard On-Demand Documentation](https://switchboard-docs.web.app/)
 
 Switchboard On-Demand is designed to support high-fidelity financial systems. It allows users to specify how data from both on-chain and off-chain sources is ingested and transformed.
 
