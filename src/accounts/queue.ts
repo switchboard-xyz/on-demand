@@ -862,7 +862,7 @@ export class Queue {
     for (let i = 0; i < oracles.length; i++) {
       try {
         // Test gateways to see if they are good. Timeout after 2 seconds.
-        const isGood = AsyncUtils.promiseWithTimeout(2000, tests[i]);
+        const isGood = await AsyncUtils.promiseWithTimeout(2000, tests[i]);
         if (!isGood) continue;
       } catch (e) {
         console.log('Gateway Timeout', e);
