@@ -1,3 +1,17 @@
+/**
+ * @file AnchorUtils - Utility functions for working with Anchor framework
+ *
+ * **Browser Compatibility Note:**
+ * Some functions in this module require Node.js file system access (fs, os, path modules).
+ * These functions will throw descriptive errors when called in browser environments:
+ * - `initKeypairFromFile()` - Use `web3.Keypair.fromSecretKey()` directly in browsers
+ * - `initWalletFromFile()` - Use browser wallet adapters instead
+ * - `loadEnv()` - Use `loadProgramFromConnection()` with your own connection/wallet
+ *
+ * All other functions (`loadProgramFromConnection`, `loadProgramFromProvider`, etc.)
+ * work in both Node.js and browser environments.
+ */
+
 import {
   isDevnetConnection,
   isMainnetConnection,
@@ -5,6 +19,9 @@ import {
   ON_DEMAND_MAINNET_PID,
 } from '../utils';
 import { getFs } from '../utils/fs';
+
+import { Queue } from './../accounts/queue.js';
+import { Gateway } from './../oracle-interfaces/gateway.js';
 
 import {
   AnchorProvider,
@@ -14,9 +31,26 @@ import {
   Wallet,
   web3,
 } from '@coral-xyz/anchor-31';
+import { CrossbarClient } from '@switchboard-xyz/common';
 import yaml from 'js-yaml';
-import os from 'os';
-import path from 'path';
+
+// Node.js-only imports - these functions will throw in browser environments
+let os: typeof import('os');
+let path: typeof import('path');
+let NodeWallet: typeof Wallet | undefined;
+
+try {
+  if (typeof window === 'undefined') {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    os = require('os');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    path = require('path');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    NodeWallet = require('@coral-xyz/anchor-31/dist/cjs/nodewallet').default;
+  }
+} catch {
+  // Browser environment - these modules won't be available
+}
 
 type SolanaConfig = {
   rpcUrl: string;
@@ -28,6 +62,9 @@ type SolanaConfig = {
   provider: AnchorProvider;
   wallet: Wallet;
   program: Program | null;
+  crossbar: CrossbarClient;
+  queue: Queue;
+  gateway: Gateway;
 };
 
 const readonlyWallet: AnchorProvider['wallet'] = {
@@ -47,32 +84,41 @@ const readonlyWallet: AnchorProvider['wallet'] = {
  * to simplify common tasks when working with Anchor.
  */
 export class AnchorUtils {
-  private static async initWalletFromKeypair(keypair: web3.Keypair) {
-    const { default: NodeWallet } = await import(
-      '@coral-xyz/anchor-31/dist/cjs/nodewallet'
-    );
+  private static initWalletFromKeypair(keypair: web3.Keypair) {
+    if (!NodeWallet) {
+      throw new Error(
+        'NodeWallet is only available in Node.js environments. ' +
+          'For browser environments, use wallet adapters like @solana/wallet-adapter-react.'
+      );
+    }
     return new NodeWallet(keypair);
   }
 
   /**
    * Initializes a wallet from a file.
    *
+   * **Node.js only** - This function requires file system access and will throw in browser environments.
+   *
    * @param {string} filePath - The path to the file containing the wallet's secret key.
    * @returns {Promise<[Wallet, web3.Keypair]>} A promise that resolves to a tuple containing the wallet and the keypair.
+   * @throws {Error} When called in a browser environment
    */
-  static async initWalletFromFile(filePath: string) {
-    const keypair = await AnchorUtils.initKeypairFromFile(filePath);
-    const wallet = await AnchorUtils.initWalletFromKeypair(keypair);
+  static initWalletFromFile(filePath: string) {
+    const keypair = AnchorUtils.initKeypairFromFile(filePath);
+    const wallet = AnchorUtils.initWalletFromKeypair(keypair);
     return [wallet, keypair] as const;
   }
 
   /**
    * Initializes a keypair from a file.
    *
+   * **Node.js only** - This function requires file system access and will throw in browser environments.
+   *
    * @param {string} filePath - The path to the file containing the keypair's secret key.
    * @returns {Promise<web3.Keypair>} A promise that resolves to the keypair.
+   * @throws {Error} When called in a browser environment
    */
-  static async initKeypairFromFile(filePath: string): Promise<web3.Keypair> {
+  static initKeypairFromFile(filePath: string): web3.Keypair {
     const secretKeyString = getFs().readFileSync(filePath, {
       encoding: 'utf8',
     });
@@ -130,9 +176,18 @@ export class AnchorUtils {
   /**
    * Loads the same environment set for the Solana CLI.
    *
+   * **Node.js only** - This function requires file system access and will throw in browser environments.
+   *
    * @returns {Promise<SolanaConfig>} A promise that resolves to the Solana configuration.
+   * @throws {Error} When called in a browser environment
    */
   static async loadEnv(): Promise<SolanaConfig> {
+    if (!os || !path) {
+      throw new Error(
+        'AnchorUtils.loadEnv() is only available in Node.js environments. ' +
+          'For browser environments, use loadProgramFromConnection() with your own connection and wallet.'
+      );
+    }
     const configPath = path.join(os.homedir(), '.config/solana/cli/config.yml');
     const fileContents = getFs().readFileSync(configPath, 'utf8');
     const data = yaml.load(fileContents);
@@ -144,13 +199,21 @@ export class AnchorUtils {
     });
 
     const keypairPath = data.keypair_path;
-    const keypair = (await AnchorUtils.initWalletFromFile(keypairPath))[1];
-    const wallet = await this.initWalletFromKeypair(keypair);
+    const crossbar = new CrossbarClient('http://crossbar.switchboard.xyz');
+
+    const [wallet, keypair] = await AnchorUtils.initWalletFromFile(keypairPath);
     const provider = new AnchorProvider(connection, wallet);
 
     const isMainnet = await isMainnetConnection(connection);
+
     const pid = isMainnet ? ON_DEMAND_MAINNET_PID : ON_DEMAND_DEVNET_PID;
+
     const program = await Program.at(pid, provider);
+    let queue = new Queue(program, Queue.DEFAULT_MAINNET_KEY);
+    if (!isMainnet) {
+      queue = new Queue(program, Queue.DEFAULT_DEVNET_KEY);
+    }
+    const gateway = await queue.fetchGatewayFromCrossbar(crossbar);
 
     return {
       rpcUrl: connection.rpcEndpoint,
@@ -162,6 +225,9 @@ export class AnchorUtils {
       provider: provider,
       wallet: wallet,
       program: program,
+      crossbar: crossbar,
+      queue,
+      gateway,
     };
   }
 

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["./src/index.ts"],
+  "out": "./docs",
+  "name": "Switchboard On-Demand SDK",
+  "includeVersion": true,
+  "excludeExternals": true,
+  "excludePrivate": true,
+  "excludeProtected": false,
+  "readme": "./README.md",
+  "theme": "default",
+  "categorizeByGroup": true,
+  "defaultCategory": "Other",
+  "categoryOrder": [
+    "Classes",
+    "Interfaces",
+    "Types",
+    "Functions",
+    "Variables",
+    "*",
+    "Other"
+  ],
+  "groupOrder": [
+    "Core",
+    "Accounts", 
+    "Oracle Interfaces",
+    "Classes",
+    "Utils",
+    "*"
+  ],
+  "sort": ["source-order"],
+  "kindSortOrder": [
+    "Project",
+    "Module",
+    "Namespace",
+    "Enum",
+    "Class",
+    "Interface",
+    "TypeAlias",
+    "Constructor",
+    "Property",
+    "Variable",
+    "Function",
+    "Method",
+    "Accessor"
+  ],
+  "navigation": {
+    "includeCategories": true,
+    "includeGroups": true
+  },
+  "searchInComments": true,
+  "searchInDocuments": true,
+  "visibilityFilters": {
+    "protected": false,
+    "private": false,
+    "inherited": true,
+    "external": false
+  },
+  "titleLink": "https://docs.switchboard.xyz",
+  "navigationLinks": {
+    "Documentation": "https://docs.switchboard.xyz",
+    "GitHub": "https://github.com/switchboard-xyz/switchboard",
+    "Discord": "https://discord.gg/switchboardxyz"
+  },
+  "sidebarLinks": {
+    "Documentation": "https://docs.switchboard.xyz",
+    "GitHub": "https://github.com/switchboard-xyz/switchboard"
+  }
+}

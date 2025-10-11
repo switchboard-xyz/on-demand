@@ -3,7 +3,7 @@ import { GATEWAY_PING_CACHE } from './../utils/cache.js';
 
 import type { BN, web3 } from '@coral-xyz/anchor-31';
 import type { Program } from '@coral-xyz/anchor-31';
-import type { IOracleJob } from '@switchboard-xyz/common';
+import type { IOracleFeed, IOracleJob } from '@switchboard-xyz/common';
 import {
   CrossbarClient,
   OracleFeedUtils,
@@ -23,7 +23,7 @@ const axiosClient: () => AxiosInstance = (() => {
 /**
  * Configuration for a feed request to oracle operators
  */
-export type FeedRequest = {
+export type FeedRequestV1 = {
   /** Maximum allowed variance between oracle responses (e.g., 1.0 = 100%) */
   maxVariance?: number;
   /** Minimum number of oracle responses required */
@@ -31,6 +31,19 @@ export type FeedRequest = {
   /** Array of oracle job definitions */
   jobs: IOracleJob[];
 };
+
+/**
+ * Configuration for a feed request to oracle operators
+ */
+export type FeedRequestV2 = {
+  /** Base64 encoded feed proto */
+  feed: IOracleFeed;
+};
+
+/**
+ * Configuration for a feed request to oracle operators
+ */
+export type FeedRequest = FeedRequestV1 | FeedRequestV2;
 
 /**
  * Response from a single oracle for a feed evaluation
@@ -89,6 +102,16 @@ export type FeedEvalResponse = {
    * Timestamp marking when the result was fetched
    */
   timestamp?: number;
+
+  /**
+   * Minimum number of oracle samples required
+   */
+  min_oracle_samples: number;
+
+  /**
+   * Task execution receipts
+   */
+  receipts?: Array<Record<string, unknown>>;
 };
 
 export type FeedEvalManyResponse = {
@@ -121,11 +144,24 @@ export type FetchSignaturesConsensusResponse = {
     signature: string;
     checksum: string;
     recovery_id: number;
+    ed25519_enclave_signer: string;
     feed_responses: FeedEvalResponse[];
     errors: string[];
     oracle_idx: number;
     min_oracle_samples: number;
   }[];
+  failed_oracle_responses: {
+    oracle_pubkey: string;
+    eth_address: string;
+    signature: string;
+    checksum: string;
+    recovery_id: number;
+    ed25519_enclave_signer: string;
+    feed_responses: FeedEvalResponse[];
+    errors: string[];
+    oracle_idx: number;
+  }[];
+  recent_hash: string;
   slot: BN;
 };
 
@@ -338,25 +374,103 @@ function encodeJobs(jobArray: IOracleJob[]): string[] {
  * - Managing oracle selection and consensus
  * - Batch operations for multiple feeds
  * - Network latency optimization
+ * - Variable overrides for dynamic task customization
  *
  * Gateways are geo-distributed endpoints that route requests to
  * available oracle operators for optimal performance.
  *
- * @example
+ * ## Variable Overrides
+ *
+ * Variable overrides allow you to dynamically customize oracle task execution
+ * by providing key-value pairs that replace variables within oracle jobs.
+ * This is particularly useful for:
+ *
+ * - **API Key Management**: Override API keys for different environments
+ * - **Dynamic Parameters**: Change URLs, endpoints, or query parameters
+ * - **A/B Testing**: Switch between different data sources
+ * - **Environment Configuration**: Use different settings for dev/staging/prod
+ *
+ * ### Usage Examples
+ *
  * ```typescript
- * // Create gateway from URL
+ * // Create gateway
  * const gateway = new Gateway(program, 'https://gateway.switchboard.xyz');
  *
- * // Fetch signatures for feeds
+ * // Basic feed fetch with API key override
  * const response = await gateway.fetchSignatures({
+ *   jobs: [buildApiJob('${API_KEY}')], // Job uses ${API_KEY} variable
+ *   numSignatures: 3,
+ *   variableOverrides: {
+ *     'API_KEY': 'prod-api-key-123',
+ *     'BASE_URL': 'https://api.prod.example.com'
+ *   }
+ * });
+ *
+ * // Batch processing with environment-specific overrides
+ * const batchResponse = await gateway.fetchSignaturesBatch({
  *   feedConfigs: [{
- *     jobs: [buildBinanceJob('BTCUSDT')],
- *     maxVariance: 1.0,
- *     minResponses: 3,
+ *     jobs: [buildJob('${ENDPOINT}/price/${SYMBOL}')],
+ *     maxVariance: 0.5,
+ *     minResponses: 2
  *   }],
  *   numSignatures: 5,
+ *   variableOverrides: {
+ *     'ENDPOINT': 'https://api.staging.example.com',
+ *     'SYMBOL': 'BTCUSD',
+ *     'TIMEOUT': '30000'
+ *   }
+ * });
+ *
+ * // Multi-feed with shared overrides
+ * const multiResponse = await gateway.fetchSignaturesMulti({
+ *   feedConfigs: [
+ *     { jobs: [priceJob1], maxVariance: 1.0, minResponses: 1 },
+ *     { jobs: [priceJob2], maxVariance: 1.5, minResponses: 2 }
+ *   ],
+ *   numSignatures: 4,
+ *   variableOverrides: {
+ *     'API_VERSION': 'v2',
+ *     'RATE_LIMIT': '100'
+ *   }
+ * });
+ *
+ * // Consensus with authentication override
+ * const consensusResponse = await gateway.fetchSignaturesConsensus({
+ *   feedConfigs: [{ feed: myFeedConfig }],
+ *   numSignatures: 7,
+ *   variableOverrides: {
+ *     'AUTH_TOKEN': await getAuthToken(),
+ *     'REGION': 'us-east-1'
+ *   }
  * });
  * ```
+ *
+ * ### Variable Syntax in Jobs
+ *
+ * Variables in oracle jobs use the `${VARIABLE_NAME}` syntax:
+ *
+ * ```typescript
+ * const httpJob = {
+ *   tasks: [{
+ *     httpTask: {
+ *       url: '${BASE_URL}/api/${VERSION}/price?symbol=${SYMBOL}&key=${API_KEY}',
+ *       method: 'GET',
+ *       headers: {
+ *         'Authorization': 'Bearer ${AUTH_TOKEN}',
+ *         'User-Agent': '${USER_AGENT}'
+ *       }
+ *     }
+ *   }]
+ * };
+ * ```
+ *
+ * ### Best Practices
+ *
+ * 1. **Security**: Never hardcode sensitive API keys in jobs - use overrides
+ * 2. **Environment Management**: Use overrides to switch between dev/staging/prod
+ * 3. **Flexibility**: Design jobs with variables for maximum reusability
+ * 4. **Validation**: Ensure all required variables are provided in overrides
+ * 5. **Documentation**: Document expected variables in your job definitions
  *
  * @class Gateway
  */
@@ -397,6 +511,7 @@ export class Gateway {
    *  @param recentHash The chain metadata to sign with. Blockhash or slothash.
    *  @param encodedJobs The base64 encoded oracle jobs.
    *  @param numSignatures The number of oracles to fetch signatures from.
+   *  @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
    *  @returns A promise that resolves to the feed evaluation responses.
    *  @throws if the request fails.
    */
@@ -407,6 +522,7 @@ export class Gateway {
     maxVariance: number;
     minResponses: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     // TODO: have total NumOracles count against rate limit per IP
     const { recentHash, encodedJobs, numSignatures } = params;
@@ -423,6 +539,7 @@ export class Gateway {
       max_variance: maxVariance,
       min_responses: params.minResponses,
       use_timestamp: params.useTimestamp ?? false,
+      variable_overrides: params.variableOverrides ?? {},
     });
     return axiosClient()
       .post(url, body, {
@@ -485,7 +602,7 @@ export class Gateway {
   }
 
   /**
-   * Fetches a quote from the gateway.
+   * Fetches an attestation quote from the gateway.
    *
    * REST API endpoint: /api/v1/gateway_fetch_quote
    *
@@ -496,7 +613,7 @@ export class Gateway {
    * @returns A promise that resolves to the quote response.
    * @throws if the request fails.
    */
-  async fetchQuote(params: {
+  async fetchAttestationQuote(params: {
     blockhash: string;
     get_for_oracle: boolean;
     get_for_guardian: boolean;
@@ -536,6 +653,7 @@ export class Gateway {
    *  @param maxVariance The maximum variance allowed in the feed values.
    *  @param minResponses The minimum number of responses of jobs to succeed.
    *  @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+   *  @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
    *  @returns A promise that resolves to the feed evaluation responses.
    *  @throws if the request fails.
    */
@@ -546,6 +664,7 @@ export class Gateway {
     maxVariance?: number;
     minResponses?: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     params.numSignatures = params.numSignatures ?? 1;
     params.maxVariance = params.maxVariance ?? 1;
@@ -557,6 +676,7 @@ export class Gateway {
       maxVariance,
       minResponses,
       useTimestamp,
+      variableOverrides,
     } = params;
     const encodedJobs = encodeJobs(jobs);
     const res = await this.fetchSignaturesFromEncoded({
@@ -566,17 +686,36 @@ export class Gateway {
       maxVariance,
       minResponses,
       useTimestamp,
+      variableOverrides,
     });
     return res;
   }
 
+  /**
+   * Fetches signatures from multiple feeds
+   *
+   * @param recentHash The chain metadata to sign with. Blockhash or slothash.
+   * @param feedConfigs Array of feed configurations to fetch signatures for.
+   * @param numSignatures The number of oracles to fetch signatures from.
+   * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+   * @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
+   * @returns A promise that resolves to the feed evaluation responses.
+   * @throws if the request fails.
+   */
   async fetchSignaturesMulti(params: {
     recentHash?: string;
-    feedConfigs: FeedRequest[];
+    feedConfigs: FeedRequestV1[];
     numSignatures?: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesMultiResponse> {
-    const { recentHash, feedConfigs, useTimestamp, numSignatures } = params;
+    const {
+      recentHash,
+      feedConfigs,
+      useTimestamp,
+      numSignatures,
+      variableOverrides,
+    } = params;
     const encodedConfigs = feedConfigs.map(config => ({
       encodedJobs: encodeJobs(config.jobs),
       maxVariance: config.maxVariance ?? 1,
@@ -587,6 +726,7 @@ export class Gateway {
       encodedConfigs,
       numSignatures: numSignatures ?? 1,
       useTimestamp,
+      variableOverrides,
     });
     return res;
   }
@@ -600,6 +740,7 @@ export class Gateway {
     }[];
     numSignatures: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesMultiResponse> {
     // TODO: have total NumOracles count against rate limit per IP
     const { recentHash, encodedConfigs, numSignatures } = params;
@@ -622,6 +763,7 @@ export class Gateway {
         min_responses: config.minResponses ?? 1,
         use_timestamp: params.useTimestamp ?? false,
       })),
+      variable_overrides: params.variableOverrides ?? {},
     };
     const data = JSON.stringify(body);
     try {
@@ -641,16 +783,25 @@ export class Gateway {
    * @param feedConfigs The feed configurations to fetch signatures for.
    * @param numSignatures The number of oracles to fetch signatures from.
    * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+   * @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
    * @returns A promise that resolves to the feed evaluation responses.
    * @throws if the request fails.
    */
   async fetchSignaturesBatch(params: {
     recentHash?: string;
-    feedConfigs: FeedRequest[];
+    feedConfigs: FeedRequestV1[];
     numSignatures?: number;
     useTimestamp?: boolean;
+    useEd25519?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesBatchResponse> {
-    const { recentHash, feedConfigs, useTimestamp, numSignatures } = params;
+    const {
+      recentHash,
+      feedConfigs,
+      useTimestamp,
+      numSignatures,
+      variableOverrides,
+    } = params;
     const encodedConfigs = feedConfigs.map(config => {
       const encodedJobs = encodeJobs(config.jobs);
       return {
@@ -664,6 +815,7 @@ export class Gateway {
       encodedConfigs,
       numSignatures: numSignatures ?? 1,
       useTimestamp,
+      variableOverrides,
     });
     return res;
   }
@@ -676,6 +828,7 @@ export class Gateway {
    * @param encodedConfigs The encoded feed configurations to fetch signatures for.
    * @param numSignatures The number of oracles to fetch signatures from.
    * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+   * @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
    * @returns A promise that resolves to the feed evaluation responses.
    * @throws if the request fails.
    */
@@ -688,6 +841,7 @@ export class Gateway {
     }[];
     numSignatures: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesBatchResponse> {
     type BatchFeedRequests = {
       jobs_b64_encoded: string[];
@@ -707,6 +861,7 @@ export class Gateway {
       signature_scheme: 'Secp256k1',
       hash_scheme: 'Sha256',
       feed_requests: [] as BatchFeedRequests,
+      variable_overrides: params.variableOverrides ?? {},
     };
     for (const config of encodedConfigs) {
       const maxVariance = Math.floor(Number(config.maxVariance ?? 1) * 1e9);
@@ -729,29 +884,69 @@ export class Gateway {
     }
   }
 
+  /**
+   * Fetches signatures using consensus mechanism
+   * REST API endpoint: /api/v1/fetch_signatures_consensus
+   *
+   * @param feedConfigs Array of feed configurations to fetch signatures for.
+   * @param useTimestamp Whether to use the timestamp in the response & to encode update signature.
+   * @param numSignatures The number of oracles to fetch signatures from.
+   * @param useEd25519 Whether to use Ed25519 signatures instead of secp256k1.
+   * @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
+   * @returns A promise that resolves to the consensus response.
+   * @throws if the request fails.
+   */
   async fetchSignaturesConsensus(params: {
     feedConfigs: FeedRequest[];
     useTimestamp?: boolean;
     numSignatures?: number;
+    useEd25519?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesConsensusResponse> {
     const { feedConfigs } = params;
 
-    const feedRequests = feedConfigs.map(config => ({
-      jobs_b64_encoded: encodeJobs(config.jobs),
-      max_variance: Math.floor(Number(config.maxVariance ?? 1) * 1e9),
-      min_responses: config.minResponses ?? 1,
-    }));
+    const isV1 = feedConfigs.every(config => 'jobs' in config);
+    const isV2 = feedConfigs.every(config => 'feed' in config);
+
+    if (!isV1 && !isV2) {
+      throw new Error(
+        '[Switchboard] Malformed input: feedConfigs must be either FeedRequestV1 or FeedRequestV2'
+      );
+    }
+
+    const feedRequests = isV1
+      ? feedConfigs.map(config => ({
+          jobs_b64_encoded: encodeJobs(config.jobs),
+          max_variance: Math.floor(Number(config.maxVariance ?? 1) * 1e9),
+          min_responses: config.minResponses ?? 1,
+        }))
+      : feedConfigs.map(config => ({
+          feed_proto_b64: OracleFeedUtils.serializeOracleFeed(
+            config.feed
+          ).toString('base64'),
+        }));
+
+    // if numSignatures is provided, use it, otherwise use the max of the minOracleSamples for each feed (or 1 for v1)
+    const numOracles =
+      params.numSignatures ??
+      (isV2
+        ? Math.max(...feedConfigs.map(fc => fc.feed.minOracleSamples ?? 1))
+        : 1);
 
     const url = `${this.gatewayUrl}/gateway/api/v1/fetch_signatures_consensus`;
     const method = 'POST';
     const headers = { 'Content-Type': 'application/json' };
+    const useEd25519 = params.useEd25519 ?? false;
     const data = JSON.stringify({
       api_version: '1.0.0',
       recent_hash: '',
-      signature_scheme: 'Secp256k1',
+      signature_scheme: useEd25519 ? 'Ed25519' : 'Secp256k1',
       hash_scheme: 'Sha256',
       feed_requests: feedRequests,
-      num_oracles: params.numSignatures ?? 1,
+      num_oracles: numOracles,
+      use_timestamp: params.useTimestamp ?? false,
+      use_ed25519: useEd25519,
+      variable_overrides: params.variableOverrides ?? {},
     });
 
     try {
@@ -763,26 +958,97 @@ export class Gateway {
     }
   }
 
-  async fetchUpdateBundle(
+  /**
+   * Fetches oracle quote data from the gateway
+   *
+   * This method retrieves signed price quotes from oracle operators through
+   * the gateway interface. It's the primary method for fetching oracle data
+   * using the modern quote terminology.
+   *
+   * ## Protocol Details
+   * - Uses Ed25519 signature scheme for efficient verification
+   * - Supports both protobuf and legacy job specifications
+   * - Implements consensus mechanism across multiple oracles
+   * - Returns structured response with oracle metadata
+   *
+   * ## Response Structure
+   * The returned response contains:
+   * - `oracle_responses`: Array of signed oracle data
+   * - `recent_hash`: Recent Solana block hash for replay protection
+   * - `slot`: Recent slot number for temporal validation
+   *
+   * @param {CrossbarClient} crossbar - Crossbar client for data routing and feed resolution
+   * @param {string[]} feedHashes - Array of feed hashes to fetch (hex strings, max 16)
+   * @param {number} numSignatures - Number of oracle signatures required (default: 1, max based on queue config)
+   * @returns {Promise<FetchSignaturesConsensusResponse>} Oracle quote response with signatures
+   *
+   * @throws {Error} When gateway is unreachable or returns error
+   * @throws {Error} When crossbar cannot resolve feed hashes
+   * @throws {Error} When insufficient oracles are available
+   *
+   * @since 2.14.0
+   * @see {@link fetchUpdateBundle} - Deprecated equivalent method
+   * @see {@link Queue.fetchQuoteIx} - High-level method that uses this internally
+   *
+   * @example
+   * ```typescript
+   * import { CrossbarClient } from '@switchboard-xyz/common';
+   *
+   * // Initialize crossbar client
+   * const crossbar = CrossbarClient.default();
+   *
+   * // Single feed quote
+   * const btcQuote = await gateway.fetchQuote(
+   *   crossbar,
+   *   ['0xef0d8b6fcd0104e3e75096912fc8e1e432893da4f18faedaacca7e5875da620f'], // BTC/USD
+   *   1 // Single signature for fast updates
+   * );
+   *
+   * // Multi-feed quote for DeFi protocol
+   * const defiAssets = [
+   *   '0xef0d8b6fcd0104e3e75096912fc8e1e432893da4f18faedaacca7e5875da620f', // BTC/USD
+   *   '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef', // ETH/USD
+   *   '0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890', // SOL/USD
+   *   '0x9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba'  // USDC/USD
+   * ];
+   *
+   * const portfolioQuote = await gateway.fetchQuote(
+   *   crossbar,
+   *   defiAssets,
+   *   5 // Higher consensus for financial operations
+   * );
+   *
+   * // Access oracle responses
+   * console.log('Oracle responses:', portfolioQuote.oracle_responses.length);
+   * console.log('Recent slot:', portfolioQuote.slot);
+   *
+   * // Process individual feed responses
+   * portfolioQuote.oracle_responses.forEach((oracle, index) => {
+   *   oracle.feed_responses.forEach((feed, feedIndex) => {
+   *     console.log(`Oracle ${index}, Feed ${feedIndex}:`, {
+   *       feedHash: feed.feed_hash,
+   *       value: feed.success_value,
+   *       confidence: feed.min_oracle_samples
+   *     });
+   *   });
+   * });
+   * ```
+   */
+  async fetchQuote(
     crossbar: CrossbarClient,
     feedHashes: string[],
-    numSignatures: number = 1
+    numSignatures: number = 1,
+    variableOverrides?: Record<string, string>
   ): Promise<FetchSignaturesConsensusResponse> {
     const feedRequests = await Promise.all(
       feedHashes.map(async hash => {
         try {
-          const oracleFeed = await crossbar.fetchOracleFeed(hash);
-          const minOracleResponses = oracleFeed.feed.minOracleSamples ?? 1;
-          if (numSignatures < minOracleResponses) {
-            numSignatures = minOracleResponses;
-          }
-          const buffer = OracleFeedUtils.serializeOracleFeed(
-            oracleFeed.feed
-          ).toString('base64');
+          const ipfsData = await crossbar.fetchOracleFeed(hash);
           return {
-            feed_proto_b64: buffer,
+            feed_proto_b64: ipfsData.data,
           };
         } catch {
+          console.warn('Using fallback v1 fetch for feed', hash);
           const { jobs } = await crossbar.fetch(hash);
           return {
             jobs_b64_encoded: encodeJobs(jobs),
@@ -799,20 +1065,35 @@ export class Gateway {
     const headers = { 'Content-Type': 'application/json' };
     const data = JSON.stringify({
       api_version: '1.0.0',
-      signature_scheme: 'Secp256k1',
+      signature_scheme: 'Ed25519',
       hash_scheme: 'Sha256',
       feed_requests: feedRequests,
       recent_hash: '',
       num_oracles: numSignatures,
+      use_ed25519: true,
+      variable_overrides: variableOverrides ?? {},
     });
 
     try {
       const resp = await axiosClient()(url, { method, headers, data });
       return resp.data;
     } catch (err) {
-      console.error('fetchUpdateBundle error', err);
+      console.error('fetchQuote error', err);
       throw err;
     }
+  }
+
+  /**
+   * @deprecated Use {@link fetchQuote} instead. The bundle terminology has been replaced with quote terminology.
+   *
+   * Fetches oracle bundle data from the gateway
+   */
+  async fetchUpdateBundle(
+    crossbar: CrossbarClient,
+    feedHashes: string[],
+    numSignatures: number = 1
+  ): Promise<FetchSignaturesConsensusResponse> {
+    return this.fetchQuote(crossbar, feedHashes, numSignatures);
   }
 
   /**

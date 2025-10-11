@@ -1,17 +1,25 @@
+import { OracleQuote, QUOTE_PROGRAM_ID } from '../classes/oracleQuote.js';
 import {
   SOL_NATIVE_MINT,
   SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+  SPL_SYSVAR_INSTRUCTIONS_ID,
+  SPL_SYSVAR_SLOT_HASHES_ID,
   SPL_TOKEN_PROGRAM_ID,
 } from '../constants.js';
-import type { Secp256k1Signature } from '../instruction-utils/Secp256k1InstructionUtils.js';
-import { Secp256k1InstructionUtils } from '../instruction-utils/Secp256k1InstructionUtils.js';
+// import type { Ed25519Signature } from '../instruction-utils/Ed25519InstructionUtils.js';
+import { Ed25519InstructionUtils } from '../instruction-utils/Ed25519InstructionUtils.js';
+// import type { Secp256k1Signature } from '../instruction-utils/Secp256k1InstructionUtils.js';
+// import { Secp256k1InstructionUtils } from '../instruction-utils/Secp256k1InstructionUtils.js';
 import type {
   FeedEvalResponse,
   FetchSignaturesBatchResponse,
   FetchSignaturesConsensusResponse,
   FetchSignaturesMultiResponse,
 } from '../oracle-interfaces/gateway.js';
-import type { FeedRequest } from '../oracle-interfaces/gateway.js';
+import type {
+  FeedRequest,
+  FeedRequestV1,
+} from '../oracle-interfaces/gateway.js';
 import { Gateway } from '../oracle-interfaces/gateway.js';
 import { getAssociatedTokenAddress, getNodePayer } from '../utils/index.js';
 import { getLutKey, getLutSigner } from '../utils/lookupTable.js';
@@ -23,9 +31,50 @@ import { State } from './state.js';
 
 import type { Program } from '@coral-xyz/anchor-31';
 import { BN, web3 } from '@coral-xyz/anchor-31';
-import { CrossbarClient } from '@switchboard-xyz/common';
+import type { IOracleFeed } from '@switchboard-xyz/common';
+import { CrossbarClient, FeedHash } from '@switchboard-xyz/common';
 import { AsyncUtils, type IOracleJob, toUtf8 } from '@switchboard-xyz/common';
+import axios from 'axios';
 import { Buffer } from 'buffer';
+
+/**
+ * Health response from gateway/oracle test endpoints
+ */
+interface HealthResponse {
+  chain: string;
+  disable_heartbeats: boolean;
+  ed25519_pubkey: string;
+  enable_gateway: number;
+  enable_guardian: number;
+  enable_pull_oracle: number;
+  enable_push_oracle: number;
+  gateway_advertise_interval: number;
+  gateway_ingress: string;
+  heartbeat_interval: number;
+  key_rotate_interval: number;
+  mr_enclave: string;
+  network_id: string;
+  oracle_authority: string;
+  oracle_ingress: string;
+  pagerduty_api_key: string;
+  payer_secret: string;
+  payer_secret_filepath: string;
+  guardian_oracle: string;
+  pull_oracle: string;
+  push_oracle: string;
+  push_queue: string;
+  routine_max_jitter: number;
+  rpc_url: string;
+  secp256k1_pubkey: string;
+  switchboard_on_demand_program_id: string;
+  version_filepath: string;
+  version: string;
+  wss_rpc_url: string;
+  known_oracles: string;
+  system_time: number;
+  restricted: boolean;
+  api_key_service_url: string;
+}
 
 /**
  * On-chain queue account data structure
@@ -88,28 +137,61 @@ export interface QueueAccountData {
  * in the Switchboard network. It manages:
  *
  * - Oracle operator authorization and verification
- * - Bundle fetching and signature verification
+ * - Quote fetching and signature verification
  * - Address lookup table management
  * - Gateway interactions for data retrieval
  *
  * ## Key Features
  *
  * - **Oracle Management**: Track and verify authorized oracle signers
- * - **Bundle Operations**: Fetch signed data bundles from oracle operators
+ * - **Quote Operations**: Fetch signed data quotes from oracle operators
  * - **LUT Optimization**: Automatic address lookup table management
  * - **Network Detection**: Automatic mainnet/devnet queue selection
  *
  * @example
  * ```typescript
+ * import * as sb from '@switchboard-xyz/on-demand';
+ *
+ * // Initialize program and connection
+ * const program = anchor.workspace.SwitchboardOnDemand;
+ * const connection = new Connection("https://api.devnet.solana.com");
+ *
  * // Load the default queue for your network
  * const queue = await Queue.loadDefault(program);
  *
- * // Fetch a bundle for specific feeds
- * const [sigVerifyIx, bundle] = await queue.fetchUpdateBundleIx(
+ * // Set up gateway and crossbar
+ * const crossbar = sb.CrossbarClient.default();
+ * const gateway = await queue.fetchGatewayFromCrossbar(crossbar);
+ *
+ * // Fetch a quote for specific feeds (BTC/USD and ETH/USD)
+ * const feedHashes = [
+ *   '0xef0d8b6fcd0104e3e75096912fc8e1e432893da4f18faedaacca7e5875da620f', // BTC/USD
+ *   '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'  // ETH/USD
+ * ];
+ *
+ * const sigVerifyIx = await queue.fetchQuoteIx(
  *   gateway,
  *   crossbar,
- *   ['0x1234...', '0x5678...'] // Feed hashes
+ *   feedHashes,
+ *   {
+ *     numSignatures: 3, // Require 3 oracle signatures for consensus
+ *     variableOverrides: {},
+ *     instructionIdx: 0
+ *   }
  * );
+ *
+ * // Build and send transaction
+ * const tx = await sb.asV0Tx({
+ *   connection,
+ *   ixs: [sigVerifyIx, yourBusinessLogicIx],
+ *   signers: [payer],
+ *   computeUnitPrice: 200_000,
+ *   computeUnitLimitMultiple: 1.3,
+ * });
+ *
+ * await connection.sendTransaction(tx, {
+ *   preflightCommitment: "processed",
+ * });
  * ```
  *
  * @class Queue
@@ -118,6 +200,7 @@ export class Queue {
   private data: QueueAccountData | null = null;
   private lookupTable: web3.AddressLookupTableAccount | null = null;
   private lookupTableRefreshTime: number = 0;
+  private cachedGateway: Gateway | null = null;
   static readonly DEFAULT_DEVNET_KEY: web3.PublicKey = new web3.PublicKey(
     'EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7'
   );
@@ -158,7 +241,8 @@ export class Queue {
    *
    * The gateway is the interface to oracle operators. This method
    * automatically detects your network and returns an appropriate
-   * gateway for fetching oracle data.
+   * gateway for fetching oracle data. The gateway is cached after
+   * the first successful fetch and reused for subsequent calls.
    *
    * @param {CrossbarClient} crossbar - Crossbar client instance
    * @returns {Promise<Gateway>} Gateway instance for oracle communication
@@ -170,6 +254,11 @@ export class Queue {
    * ```
    */
   async fetchGatewayFromCrossbar(crossbar: CrossbarClient): Promise<Gateway> {
+    // Return cached gateway if available
+    if (this.cachedGateway) {
+      return this.cachedGateway;
+    }
+
     let network = 'mainnet';
     try {
       const queue = new Queue(this.program, Queue.DEFAULT_MAINNET_KEY);
@@ -177,9 +266,163 @@ export class Queue {
     } catch {
       network = 'devnet';
     }
-    const gatewayUrl = (await crossbar.fetchGateways(network))[0];
-    const gateway = new Gateway(this.program, gatewayUrl!);
+
+    const gatewayUrls = await crossbar.fetchGateways(network);
+    if (!gatewayUrls || gatewayUrls.length === 0) {
+      throw new Error(`No gateways available for network: ${network}`);
+    }
+
+    const gatewayUrl = gatewayUrls[0];
+    if (!gatewayUrl) {
+      throw new Error(`Invalid gateway URL received for network: ${network}`);
+    }
+
+    const gateway = new Gateway(this.program, gatewayUrl);
+
+    // Cache the gateway for future use
+    this.cachedGateway = gateway;
+
     return gateway;
+  }
+
+  /**
+   * Fetches a gateway with the latest/majority version from Crossbar
+   *
+   * @param crossbar - CrossbarClient instance
+   * @returns Promise<Gateway> - Gateway instance with the latest version
+   */
+  async fetchGatewayByLatestVersion(
+    crossbar: CrossbarClient
+  ): Promise<Gateway> {
+    let network = 'mainnet';
+    try {
+      const queue = new Queue(this.program, Queue.DEFAULT_MAINNET_KEY);
+      await queue.loadData();
+    } catch {
+      network = 'devnet';
+    }
+
+    const gatewayUrls = await crossbar.fetchGateways(network);
+    const gatewayHealths: Array<{
+      url: string;
+      health: HealthResponse;
+      version: string;
+    }> = [];
+
+    // Check health of all gateways
+    for (const gatewayUrl of gatewayUrls) {
+      try {
+        const healthUrl = `${gatewayUrl}/gateway/api/v1/test`;
+        const response = await axios.get<HealthResponse>(healthUrl);
+        const health = response.data;
+        gatewayHealths.push({
+          url: gatewayUrl,
+          health,
+          version: health.version || 'unknown',
+        });
+      } catch (error) {
+        console.warn(
+          `Failed to fetch health for gateway ${gatewayUrl}:`,
+          error
+        );
+      }
+    }
+
+    // Find majority version
+    const versionCounts = new Map<string, number>();
+    gatewayHealths.forEach(({ version }) => {
+      versionCounts.set(version, (versionCounts.get(version) || 0) + 1);
+    });
+
+    let majorityVersion = 'unknown';
+    let maxCount = 0;
+    for (const [version, count] of versionCounts.entries()) {
+      if (count > maxCount) {
+        maxCount = count;
+        majorityVersion = version;
+      }
+    }
+
+    // Find all gateways with majority version
+    const majorityGateways = gatewayHealths.filter(
+      g => g.version === majorityVersion
+    );
+    if (majorityGateways.length === 0) {
+      throw new Error('No healthy gateways found');
+    }
+
+    // Randomly select from majority version gateways
+    const randomIndex = Math.floor(Math.random() * majorityGateways.length);
+    const selectedGateway = majorityGateways[randomIndex];
+    const gateway = new Gateway(this.program, selectedGateway.url);
+    return gateway;
+  }
+
+  /**
+   * Fetches an oracle with the latest/majority version from Crossbar
+   *
+   * @param crossbar - CrossbarClient instance
+   * @returns Promise<string> - Oracle URL with the latest version
+   */
+  async fetchOracleByLatestVersion(crossbar: CrossbarClient): Promise<string> {
+    let network = 'mainnet';
+    try {
+      const queue = new Queue(this.program, Queue.DEFAULT_MAINNET_KEY);
+      await queue.loadData();
+    } catch {
+      network = 'devnet';
+    }
+
+    const gatewayUrls = await crossbar.fetchGateways(network);
+    const oracleHealths: Array<{
+      url: string;
+      health: HealthResponse;
+      version: string;
+    }> = [];
+
+    // Check health of all oracles (using gateway URLs but oracle endpoint)
+    for (const gatewayUrl of gatewayUrls) {
+      try {
+        const healthUrl = `${gatewayUrl}/oracle/api/v1/test`;
+        const response = await axios.get<HealthResponse>(healthUrl);
+        const health = response.data;
+        oracleHealths.push({
+          url: gatewayUrl,
+          health,
+          version: health.version || 'unknown',
+        });
+      } catch (error) {
+        console.warn(`Failed to fetch oracle health for ${gatewayUrl}:`, error);
+      }
+    }
+
+    // Find majority version
+    const versionCounts = new Map<string, number>();
+    oracleHealths.forEach(({ version }) => {
+      versionCounts.set(version, (versionCounts.get(version) || 0) + 1);
+    });
+
+    let majorityVersion = 'unknown';
+    let maxCount = 0;
+    for (const [version, count] of versionCounts.entries()) {
+      if (count > maxCount) {
+        maxCount = count;
+        majorityVersion = version;
+      }
+    }
+
+    // Find all oracles with majority version
+    const majorityOracles = oracleHealths.filter(
+      o => o.version === majorityVersion
+    );
+    if (majorityOracles.length === 0) {
+      throw new Error('No healthy oracles found');
+    }
+
+    // Randomly select from majority version oracles
+    const randomIndex = Math.floor(Math.random() * majorityOracles.length);
+    const selectedOracle = majorityOracles[randomIndex];
+    return selectedOracle.url;
   }
 
   /**
@@ -373,6 +616,7 @@ export class Queue {
    *  @param recentHash The chain metadata to sign with. Blockhash or slothash.
    *  @param jobs The oracle jobs to perform.
    *  @param numSignatures The number of oracles to fetch signatures from.
+   *  @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
    *  @returns A promise that resolves to the feed evaluation responses.
    *  @throws if the request fails.
    */
@@ -386,6 +630,7 @@ export class Queue {
       numSignatures?: number;
       maxVariance?: number;
       minResponses?: number;
+      variableOverrides?: Record<string, string>;
     }
   ): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
     const queueAccount = new Queue(program, params.queue);
@@ -398,8 +643,9 @@ export class Queue {
       gateway?: string;
       queue: web3.PublicKey;
       recentHash?: string;
-      feedConfigs: FeedRequest[];
+      feedConfigs: FeedRequestV1[];
       minResponses?: number;
+      variableOverrides?: Record<string, string>;
     }
   ): Promise<FetchSignaturesMultiResponse> {
     const queueAccount = new Queue(program, params.queue!);
@@ -412,8 +658,9 @@ export class Queue {
       gateway?: string;
       queue: web3.PublicKey;
       recentHash?: string;
-      feedConfigs: FeedRequest[];
+      feedConfigs: FeedRequestV1[];
       minResponses?: number;
+      variableOverrides?: Record<string, string>;
     }
   ): Promise<FetchSignaturesBatchResponse> {
     const queueAccount = new Queue(program, params.queue!);
@@ -428,6 +675,8 @@ export class Queue {
       feedConfigs: FeedRequest[];
       useTimestamp?: boolean;
       numSignatures?: number;
+      useEd25519?: boolean;
+      variableOverrides?: Record<string, string>;
     }
   ): Promise<FetchSignaturesConsensusResponse> {
     const queueAccount = new Queue(program, params.queue!);
@@ -436,6 +685,8 @@ export class Queue {
       feedConfigs: params.feedConfigs,
       useTimestamp: params.useTimestamp,
       numSignatures: params.numSignatures,
+      useEd25519: params.useEd25519,
+      variableOverrides: params.variableOverrides,
     });
   }
 
@@ -453,6 +704,7 @@ export class Queue {
       numSignatures?: number;
       maxVariance?: number;
       minResponses?: number;
+      variableOverrides?: Record<string, string>;
     }
   ): Promise<Buffer> {
     const queueAccount = new Queue(program, params.queue);
@@ -553,19 +805,28 @@ export class Queue {
    *  @param numSignatures The number of oracles to fetch signatures from.
    *  @param maxVariance The maximum variance allowed in the responses.
    *  @param minResponses The minimum number of responses to attempt to fetch.
+   *  @param variableOverrides Optional variable overrides for task execution (e.g., {"API_KEY": "custom-key"})
    *  @returns A promise that resolves to the feed evaluation responses.
    *  @throws if the request fails.
    */
   async fetchSignatures(params: {
-    gateway?: string;
+    gateway?: string | Gateway;
     recentHash?: string;
     jobs: IOracleJob[];
     numSignatures?: number;
     maxVariance?: number;
     minResponses?: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<{ responses: FeedEvalResponse[]; failures: string[] }> {
-    const gateway = await this.fetchGateway(params.gateway);
+    let gateway: Gateway;
+    if (!params.gateway) {
+      gateway = await this.fetchGateway();
+    } else if (params.gateway instanceof Gateway) {
+      gateway = params.gateway;
+    } else {
+      gateway = new Gateway(this.program, params.gateway);
+    }
     return await gateway.fetchSignatures({
       recentHash: params.recentHash,
       jobs: params.jobs,
@@ -573,15 +834,17 @@ export class Queue {
       maxVariance: params.maxVariance,
       minResponses: params.minResponses,
       useTimestamp: params.useTimestamp,
+      variableOverrides: params.variableOverrides,
     });
   }
 
   async fetchSignaturesMulti(params: {
     gateway?: string;
     recentHash?: string;
-    feedConfigs: FeedRequest[];
+    feedConfigs: FeedRequestV1[];
     numSignatures?: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesMultiResponse> {
     const gateway = await this.fetchGateway(params.gateway);
     return await gateway.fetchSignaturesMulti({
@@ -589,29 +852,42 @@ export class Queue {
       feedConfigs: params.feedConfigs,
       numSignatures: params.numSignatures,
       useTimestamp: params.useTimestamp,
+      variableOverrides: params.variableOverrides,
     });
   }
 
   async fetchSignaturesConsensus(params: {
-    gateway?: string;
+    gateway?: string | Gateway;
     feedConfigs: FeedRequest[];
     useTimestamp?: boolean;
     numSignatures?: number;
+    useEd25519?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesConsensusResponse> {
-    const gateway = await this.fetchGateway(params.gateway);
+    let gateway: Gateway;
+    if (!params.gateway) {
+      gateway = await this.fetchGateway();
+    } else if (params.gateway instanceof Gateway) {
+      gateway = params.gateway;
+    } else {
+      gateway = new Gateway(this.program, params.gateway);
+    }
     return await gateway.fetchSignaturesConsensus({
       feedConfigs: params.feedConfigs,
       useTimestamp: params.useTimestamp,
       numSignatures: params.numSignatures,
+      useEd25519: params.useEd25519,
+      variableOverrides: params.variableOverrides,
     });
   }
 
   async fetchSignaturesBatch(params: {
     gateway?: string;
     recentHash?: string;
-    feedConfigs: FeedRequest[];
+    feedConfigs: FeedRequestV1[];
     numSignatures?: number;
     useTimestamp?: boolean;
+    variableOverrides?: Record<string, string>;
   }): Promise<FetchSignaturesBatchResponse> {
     const gateway = await this.fetchGateway(params.gateway);
     return await gateway.fetchSignaturesBatch({
@@ -619,6 +895,7 @@ export class Queue {
       feedConfigs: params.feedConfigs,
       numSignatures: params.numSignatures,
       useTimestamp: params.useTimestamp,
+      variableOverrides: params.variableOverrides,
     });
   }
 
@@ -862,10 +1139,10 @@ export class Queue {
     for (let i = 0; i < oracles.length; i++) {
       try {
         // Test gateways to see if they are good. Timeout after 2 seconds.
-        const isGood = await AsyncUtils.promiseWithTimeout(2000, tests[i]);
+        const isGood = await AsyncUtils.promiseWithTimeout(4000, tests[i]);
         if (!isGood) continue;
-      } catch (e) {
-        console.log('Gateway Timeout', e);
+      } catch {
+        // console.log('Gateway Timeout', e);
       }
       zip.push({ data: oracleAccounts[i]!, key: oracles[i] });
     }
@@ -918,6 +1195,8 @@ export class Queue {
   }
 
   /**
+   * @deprecated Use {@link fetchQuoteIx} instead. The bundle terminology has been replaced with quote terminology.
+   *
    * Fetches oracle bundle and creates verification instruction
    *
    * This is the primary method for fetching oracle data in the bundle approach.
@@ -927,18 +1206,25 @@ export class Queue {
    * @param {Gateway} gateway - Gateway instance for oracle communication
    * @param {CrossbarClient} crossbar - Crossbar client for data routing
    * @param {string[]} feedHashes - Array of feed hashes to fetch (hex strings)
-   * @param {number} numSignatures - Number of oracle signatures required (default: 1)
-   * @returns {Promise<[web3.TransactionInstruction, Buffer]>}
-   *          Tuple of [signature verification instruction, bundle data]
+   * @param {object} configs - Configuration object with optional parameters
+   * @param {Record<string, string>} [configs.variableOverrides] - Variable overrides for feed processing
+   * @param {number} [configs.numSignatures] - Number of oracle signatures required
+   * @param {number} [configs.instructionIdx] - Instruction index for Ed25519 instruction
+   * @returns {Promise<web3.TransactionInstruction>}
+   *          Signature verification instruction
    *
    * @example
    * ```typescript
    * // Fetch prices for BTC and ETH
-   * const [sigVerifyIx, bundle] = await queue.fetchUpdateBundleIx(
+   * const sigVerifyIx = await queue.fetchUpdateBundleIx(
    *   gateway,
    *   crossbar,
    *   ['0x1234...', '0x5678...'], // Feed hashes
-   *   3 // Require 3 oracle signatures
+   *   {
+   *     numSignatures: 3, // Require 3 oracle signatures
+   *     variableOverrides: {},
+   *     instructionIdx: 0
+   *   }
    * );
    *
    * // Use in your transaction
@@ -950,93 +1236,497 @@ export class Queue {
    * ```
    */
   async fetchUpdateBundleIx(
-    gateway: Gateway,
     crossbar: CrossbarClient,
     feedHashes: string[],
-    numSignatures: number = 1
-  ): Promise<[web3.TransactionInstruction, Buffer]> {
-    const response = await gateway.fetchUpdateBundle(
+    configs?: {
+      gateway?: Gateway;
+      variableOverrides?: Record<string, string>;
+      numSignatures: number;
+      instructionIdx: number;
+    }
+  ): Promise<web3.TransactionInstruction> {
+    return this.fetchQuoteIx(
       crossbar,
       feedHashes,
-      numSignatures
+      configs ?? {
+        gateway: undefined,
+        variableOverrides: {},
+        numSignatures: 1,
+        instructionIdx: 0,
+      }
     );
+  }
+
+  /**
+   * Fetches oracle quote and creates verification instruction
+   *
+   * This is the primary method for fetching oracle data in the quote approach.
+   * It retrieves signed price data from oracle operators and creates the
+   * instruction to verify signatures on-chain.
+   *
+   * ## Key Features
+   * - **Aggregated Data**: Fetches multiple feeds in a single request
+   * - **Consensus Verification**: Requires specified number of oracle signatures
+   * - **Ed25519 Signatures**: Uses efficient signature verification on-chain
+   * - **Cost Effective**: ~90% lower costs compared to individual feed updates
+   * - **Production Ready**: Handles error cases and validation
+   * - **Feed Format Flexibility**: Accepts either feed hashes (strings) or OracleFeed objects
+   *
+   * ## Security Considerations
+   * - Always use multiple signatures for high-value operations
+   * - Validate feed hashes match your expected data sources
+   * - Consider oracle staking and reputation when choosing consensus levels
+   *
+   * @param {Gateway} gateway - Gateway instance for oracle communication
+   * @param {CrossbarClient} crossbar - Crossbar client for data routing
+   * @param {string[] | IOracleFeed[]} feedHashesOrFeeds - Array of feed hashes (hex strings) or array of OracleFeed objects (max 16 feeds)
+   * @param {number} numSignatures - Number of oracle signatures required (default: 1, max 255)
+   * @param {number} instructionIdx - Instruction index for Ed25519 program (default: 0)
+   * @returns {Promise<web3.TransactionInstruction>}
+   *          Ed25519 signature verification instruction ready for transaction
+   *
+   * @throws {Error} When no oracle responses are available
+   * @throws {Error} When oracle index is out of bounds (>= 255)
+   * @throws {Error} When too many feeds requested (> 16)
+   * @throws {Error} When feed responses are missing from oracle
+   *
+   * @since 2.14.0
+   * @see {@link fetchUpdateBundleIx} - Deprecated equivalent method
+   * @see {@link Gateway.fetchQuote} - Gateway method for raw quote data
+   *
+   * @example
+   * ```typescript
+   * // Basic usage with single feed hash
+   * const btcFeedHash = '0xef0d8b6fcd0104e3e75096912fc8e1e432893da4f18faedaacca7e5875da620f';
+   * const sigVerifyIx = await queue.fetchQuoteIx(
+   *   crossbar,
+   *   [btcFeedHash],
+   *   {
+   *     numSignatures: 1, // Single oracle signature
+   *     variableOverrides: {},
+   *     instructionIdx: 0
+   *   }
+   * );
+   *
+   * // Using OracleFeed objects
+   * const btcFeed: IOracleFeed = {
+   *   name: 'BTC/USD Price Feed',
+   *   jobs: [btcJob1, btcJob2],
+   *   minOracleSamples: 3,
+   *   // ... other feed properties
+   * };
+   *
+   * const ethFeed: IOracleFeed = {
+   *   name: 'ETH/USD Price Feed',
+   *   jobs: [ethJob1, ethJob2],
+   *   minOracleSamples: 3,
+   * };
+   *
+   * const feedsIx = await queue.fetchQuoteIx(
+   *   crossbar,
+   *   [btcFeed, ethFeed],
+   *   {
+   *     numSignatures: 3,
+   *     variableOverrides: {},
+   *     instructionIdx: 0
+   *   }
+   * );
+   *
+   * // Multi-feed quote with higher consensus
+   * const feedHashes = [
+   *   '0xef0d8b6fcd0104e3e75096912fc8e1e432893da4f18faedaacca7e5875da620f', // BTC/USD
+   *   '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef', // ETH/USD
+   *   '0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890'  // SOL/USD
+   * ];
+   *
+   * const multiQuoteIx = await queue.fetchQuoteIx(
+   *   crossbar,
+   *   feedHashes,
+   *   {
+   *     numSignatures: 5, // Require 5 oracle signatures for high-value operations
+   *     variableOverrides: {},
+   *     instructionIdx: 1  // Instruction index for multiple Ed25519 instructions
+   *   }
+   * );
+   *
+   * // Use in your transaction with proper error handling
+   * try {
+   *   const tx = await asV0Tx({
+   *     connection,
+   *     ixs: [sigVerifyIx, yourBusinessLogicIx],
+   *     signers: [payer],
+   *     computeUnitPrice: 200_000,
+   *     computeUnitLimitMultiple: 1.3,
+   *   });
+   *
+   *   const txSignature = await connection.sendTransaction(tx, {
+   *     preflightCommitment: "processed",
+   *   });
+   *
+   *   console.log('Transaction confirmed:', txSignature);
+   * } catch (error) {
+   *   console.error('Quote fetch failed:', error);
+   * }
+   * ```
+   */
+  async fetchQuoteIx(
+    crossbar: CrossbarClient,
+    feedHashesOrFeeds: string[] | IOracleFeed[],
+    configs?: {
+      gateway?: Gateway;
+      variableOverrides?: Record<string, string>;
+      numSignatures?: number;
+      instructionIdx?: number;
+    }
+  ): Promise<web3.TransactionInstruction> {
+    const config = configs ?? {
+      gateway: undefined,
+      variableOverrides: {},
+      numSignatures: 1,
+      instructionIdx: 0,
+    };
+
+    if (config.gateway === undefined) {
+      try {
+        config.gateway = await this.fetchGatewayFromCrossbar(crossbar);
+      } catch (error) {
+        throw new Error(
+          `Failed to fetch gateway from crossbar: ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+      }
+    }
+
+    if (feedHashesOrFeeds.length === 0) {
+      throw new Error('At least one feed hash or OracleFeed must be provided');
+    }
+
+    let response: FetchSignaturesConsensusResponse;
+
+    // Check if first element is a string (feed hash) or object (OracleFeed)
+    if (typeof feedHashesOrFeeds[0] === 'string') {
+      // Input is an array of feed hashes - use fetchQuote which fetches from IPFS
+      const feedHashes = feedHashesOrFeeds as string[];
+      response = await config.gateway.fetchQuote(
+        crossbar,
+        feedHashes,
+        config.numSignatures ?? 1,
+        config.variableOverrides
+      );
+    } else {
+      // Input is an array of OracleFeeds - use fetchSignaturesConsensus directly
+      const feeds = feedHashesOrFeeds as IOracleFeed[];
+      feeds.forEach(feed => {
+        if (!feed.jobs || feed.jobs.length === 0) {
+          throw new Error(
+            `OracleFeed "${feed.name || 'unnamed'}" must contain at least one job`
+          );
+        }
+      });
+
+      response = await config.gateway.fetchSignaturesConsensus({
+        feedConfigs: feeds.map(feed => ({ feed })),
+        useTimestamp: false,
+        numSignatures: config.numSignatures,
+        useEd25519: true,
+        variableOverrides: config.variableOverrides,
+      });
+    }
 
     // Check if oracle_responses is empty
     if (!response.oracle_responses || response.oracle_responses.length === 0) {
-      throw new Error(
-        'No oracle responses available for creating secp256k1 signatures'
-      );
+      throw new Error('No oracle responses available for creating signatures');
     }
 
-    const secpSignatures: Secp256k1Signature[] =
-      response.oracle_responses.map<Secp256k1Signature>(oracleResponse => {
+    // Convert to ED25519 signatures - supports variable length messages!
+    const ed25519Signatures = response.oracle_responses.map(
+      (oracleResponse, index) => {
+        let pubkeyHex = oracleResponse.ed25519_enclave_signer;
+
+        // If ed25519_enclave_signer is 64 bytes (128 hex chars), extract the first 32 bytes for Ed25519 pubkey
+        if (pubkeyHex && pubkeyHex.length === 128) {
+          pubkeyHex = pubkeyHex.substring(0, 64); // First 32 bytes (64 hex chars)
+        }
+
+        // Check that we have feed responses
+        if (
+          !oracleResponse.feed_responses ||
+          oracleResponse.feed_responses.length === 0
+        ) {
+          throw new Error(`Oracle response ${index} missing feed_responses`);
+        }
+
+        // Reconstruct the actual signed message for NEW SIGNING SCHEME
+        // NEW FORMAT: signed_slothash + feed_infos (for ALL feeds)
+        // NOTE: recent_slot, version, and oracle_idx are NO LONGER part of the signed message
+        // Oracle indices are now appended to the ED25519 instruction data, not signed
+
+        // Use response-level recent_hash for slothash
+        const recentHashPubkey = new web3.PublicKey(response.recent_hash);
+        const signedSlothash = Buffer.from(recentHashPubkey.toBytes()); // 32 bytes
+
+        // Validate oracle index bounds (prevent access violation in Rust)
+        // Note: We don't have queue data here, but we can validate reasonable bounds
+        if (oracleResponse.oracle_idx >= 255) {
+          throw new Error(
+            `Oracle index out of bounds: ${oracleResponse.oracle_idx} (maximum supported is 254)`
+          );
+        }
+
+        // Validate feed count limit (must match Rust limit)
+        if (oracleResponse.feed_responses.length > 16) {
+          throw new Error(
+            `Too many feeds in oracle response: ${oracleResponse.feed_responses.length} feeds but maximum is 16`
+          );
+        }
+
+        // Build feed infos for ALL feeds (not just the first one)
+        const feedInfoBuffers: Buffer[] = [];
+        for (const feedResponse of oracleResponse.feed_responses) {
+          // Feed info: feed_id + value + min_oracle_samples
+          const feedHash = Buffer.from(feedResponse.feed_hash, 'hex'); // 32 bytes
+
+          // Convert success_value to 16-byte representation (little-endian i128)
+          const successValue = BigInt(feedResponse.success_value);
+          const valueBytes = Buffer.alloc(16);
+          for (let i = 0; i < 16; i++) {
+            const shift = BigInt(i) * BigInt(8);
+            const mask = BigInt(0xff);
+            valueBytes[i] = Number((successValue >> shift) & mask);
+          }
+
+          const minOracleSamples = Buffer.from([
+            feedResponse.min_oracle_samples,
+          ]); // 1 byte
+
+          // Concatenate this feed's info: feed_id + value + min_oracle_samples
+          feedInfoBuffers.push(
+            Buffer.concat([
+              feedHash, // 32 bytes (feed_id)
+              valueBytes, // 16 bytes (feed value as i128 LE)
+              minOracleSamples, // 1 byte (min_oracle_samples)
+            ])
+          );
+        }
+
+        // NEW SIGNED MESSAGE FORMAT: signed_slothash + (feed_info1 + feed_info2 + ...)
+        // Oracle index is NOT included in the signed message - it goes to instruction data
+        const actualMessage = Buffer.concat([
+          signedSlothash, // 32 bytes (slothash from response)
+          ...feedInfoBuffers, // All feed infos (49 bytes each)
+        ]);
+
         return {
-          ethAddress: Buffer.from(oracleResponse.eth_address, 'hex'),
-          signature: Buffer.from(oracleResponse.signature, 'base64'),
-          message: Buffer.from(oracleResponse.checksum, 'base64'),
-          recoveryId: oracleResponse.recovery_id,
+          pubkey: Buffer.from(pubkeyHex, 'hex'), // Use Ed25519 pubkey (32 bytes)!
+          signature: Buffer.from(oracleResponse.signature, 'base64'), // Use oracle-level signature for consensus!
+          message: actualMessage, // Use reconstructed Ed25519 message (variable length)!
+          oracleIdx: oracleResponse.oracle_idx, // Use actual oracle index from response
         };
-      });
-    const secpInstruction = Secp256k1InstructionUtils.buildSecp256k1Instruction(
-      secpSignatures,
-      0
+      }
     );
 
-    // Prepare the instruction data for the `pullFeedSubmitResponseManySecp` instruction.
-    const data = {
-      slotLower: Number(response.slot) & 0xff,
-      feedInfos: response.median_responses.map(
-        ({ value, feed_hash, num_oracles }) => {
-          return {
-            value: new BN(value),
-            checksum: Buffer.from(feed_hash, 'hex'),
-            numOracles: num_oracles,
-          };
-        }
-      ),
-    };
-    // // Prepare the accounts for the `pullFeedSubmitResponseManySecp` instruction.
-    // const accounts = {
-    // queue: queue!,
-    // recentSlothashes: SPL_SYSVAR_SLOT_HASHES_ID,
-    // ixSysvar: SPL_SYSVAR_INSTRUCTIONS_ID,
-    // };
-    //
-    // const verifyIx = this.program.instruction.pullFeedVerifyResponse(
-    // instructionData,
-    // {
-    // accounts,
-    // }
-    // );
-
-    // Load the lookup tables for the feeds and oracles.
-    return [secpInstruction, serializeBundleData(data)];
+    const ed25519Instruction = Ed25519InstructionUtils.buildEd25519Instruction(
+      ed25519Signatures,
+      config.instructionIdx ?? 0,
+      typeof response.slot === 'number'
+        ? response.slot
+        : response.slot.toNumber(), // recent_slot from gateway response
+      0 // version 0 for Ed25519 v0 scheme
+    );
+    return ed25519Instruction;
   }
-}
 
-export function serializeBundleData(data: {
-  slotLower: number;
-  feedInfos: { value: BN; checksum: Buffer; numOracles: number }[];
-}): Buffer {
-  const buffers: Buffer[] = [];
-
-  // slotLower: 1 byte
-  const slotBuffer = Buffer.alloc(1);
-  slotBuffer.writeUInt8(data.slotLower);
-  buffers.push(slotBuffer);
-
-  for (const feed of data.feedInfos) {
-    // checksum: 32 bytes
-    if (feed.checksum.length !== 32) {
-      throw new Error('Checksum must be 32 bytes');
+  /**
+   * Creates instructions for managed oracle updates using the new quote program
+   *
+   * This method generates instructions to call the verified_update method in the
+   * quote program (PID: orac1eFjzWL5R3RbbdMV68K9H6TaCVVcL6LjvQQWAbz).
+   * It creates both the Ed25519 signature verification instruction and the
+   * quote program instruction that verifies and stores the oracle data.
+   *
+   * The oracle account is automatically derived from the feed hashes using the
+   * canonical derivation logic. Gateway is automatically fetched and cached.
+   *
+   * ## Key Features
+   * - **Managed Updates**: Automatically handles oracle account creation and updates
+   * - **Verification**: Uses the quote program's verified_update for secure oracle data storage
+   * - **Ed25519 Signatures**: Leverages efficient signature verification
+   * - **Account Management**: Handles oracle account initialization if needed
+   * - **Gateway Caching**: Automatically fetches and caches gateway for subsequent calls
+   * - **Feed Format Flexibility**: Accepts either feed hashes (strings) or OracleFeed objects
+   *
+   * @param {Gateway} gateway - Gateway instance for oracle communication
+   * @param {CrossbarClient} crossbar - Crossbar client for data routing
+   * @param {string[] | IOracleFeed[]} feedHashesOrFeeds - Array of feed hashes (hex strings) or array of OracleFeed objects (max 16 feeds)
+   * @param {object} configs - Configuration object with optional parameters
+   * @param {Record<string, string>} [configs.variableOverrides] - Variable overrides for feed processing
+   * @param {number} [configs.numSignatures] - Number of oracle signatures required (default: 1)
+   * @param {number} [configs.instructionIdx] - Instruction index for Ed25519 program (default: 0)
+   * @param {web3.PublicKey} [configs.payer] - Payer for oracle account creation (default: program provider payer)
+   * @param {web3.PublicKey} [configs.programId] - Optional program ID for oracle account derived owner (default: QUOTE_PROGRAM_ID)
+   * @returns {Promise<web3.TransactionInstruction[]>}
+   *          Array of instructions: [Ed25519 verification, quote program verified_update]
+   *
+   * @throws {Error} When no oracle responses are available
+   * @throws {Error} When oracle index is out of bounds (>= 255)
+   * @throws {Error} When too many feeds requested (> 16)
+   * @throws {Error} When feed responses are missing from oracle
+   *
+   * @example
+   * ```typescript
+   * // Using feed hashes
+   * const btcFeedHash = '0xef0d8b6fcd0104e3e75096912fc8e1e432893da4f18faedaacca7e5875da620f';
+   *
+   * // Create the instructions (oracle account is derived automatically)
+   * const instructions = await queue.fetchManagedUpdateIxs(
+   *   crossbar,
+   *   [btcFeedHash],
+   *   {
+   *     numSignatures: 3, // Require 3 oracle signatures for consensus
+   *     variableOverrides: {},
+   *     instructionIdx: 0,
+   *     payer: myWallet.publicKey,
+   *     programId: customQuoteProgramId // Optional: use custom program ID for oracle derivation
+   *   }
+   * );
+   *
+   * // Using OracleFeed objects
+   * const btcFeed: IOracleFeed = {
+   *   name: 'BTC/USD Price Feed',
+   *   jobs: [btcJob1, btcJob2],
+   *   minOracleSamples: 3,
+   *   // ... other feed properties
+   * };
+   *
+   * const ethFeed: IOracleFeed = {
+   *   name: 'ETH/USD Price Feed',
+   *   jobs: [ethJob1, ethJob2],
+   *   minOracleSamples: 3,
+   * };
+   *
+   * const instructionsFromFeeds = await queue.fetchManagedUpdateIxs(
+   *   crossbar,
+   *   [btcFeed, ethFeed],
+   *   {
+   *     numSignatures: 3,
+   *     variableOverrides: {},
+   *     instructionIdx: 0,
+   *     payer: myWallet.publicKey
+   *   }
+   * );
+   *
+   * // Build transaction with managed update instructions
+   * const tx = await asV0Tx({
+   *   connection,
+   *   ixs: [...instructions, yourBusinessLogicIx],
+   *   signers: [payer],
+   *   computeUnitPrice: 200_000,
+   *   computeUnitLimitMultiple: 1.3,
+   * });
+   *
+   * await connection.sendTransaction(tx);
+   * ```
+   */
+  async fetchManagedUpdateIxs(
+    crossbar: CrossbarClient,
+    feedHashesOrFeeds: string[] | IOracleFeed[],
+    configs?: {
+      gateway?: Gateway;
+      variableOverrides?: Record<string, string>;
+      numSignatures?: number;
+      instructionIdx?: number;
+      payer?: web3.PublicKey;
     }
-    buffers.push(feed.checksum);
+  ): Promise<web3.TransactionInstruction[]> {
+    const config = configs ?? {
+      variableOverrides: {},
+      numSignatures: 1,
+      instructionIdx: 0,
+      gateway: undefined,
+    };
 
-    // value: 16-byte little-endian i128
-    const valueBuf = feed.value.toTwos(128).toArrayLike(Buffer, 'le', 16);
-    buffers.push(valueBuf);
-    buffers.push(Buffer.from([feed.numOracles]));
+    if (config.gateway === undefined) {
+      try {
+        config.gateway = await this.fetchGatewayFromCrossbar(crossbar);
+      } catch (error) {
+        throw new Error(
+          `Failed to fetch gateway from crossbar: ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+      }
+    }
+
+    // Handle both feed hashes and OracleFeed array input
+    let feedHashes: string[];
+    if (feedHashesOrFeeds.length === 0) {
+      throw new Error('At least one feed hash or OracleFeed must be provided');
+    }
+
+    // Check if first element is a string (feed hash) or object (OracleFeed)
+    if (typeof feedHashesOrFeeds[0] === 'string') {
+      // Input is an array of feed hashes
+      feedHashes = feedHashesOrFeeds as string[];
+    } else {
+      // Input is an array of OracleFeeds - compute hash for each
+      feedHashes = (feedHashesOrFeeds as IOracleFeed[]).map(feed => {
+        if (!feed.jobs || feed.jobs.length === 0) {
+          throw new Error(
+            `OracleFeed "${feed.name || 'unnamed'}" must contain at least one job to compute the feed hash`
+          );
+        }
+        const feedHashBuffer = FeedHash.computeOracleFeedId(feed);
+        return '0x' + feedHashBuffer.toString('hex');
+      });
+    }
+
+    // Derive the canonical oracle account from feed hashes
+    const [oracleAccount, bump] = OracleQuote.getCanonicalPubkey(
+      this.pubkey,
+      feedHashes,
+      QUOTE_PROGRAM_ID
+    );
+
+    // First get the Ed25519 signature verification instruction
+    // Pass the original feedHashesOrFeeds to avoid double IPFS fetch
+    const ed25519Ix = await this.fetchQuoteIx(
+      crossbar,
+      feedHashesOrFeeds,
+      config
+    );
+
+    // Get payer from config or program provider
+    const payer = config.payer ?? getNodePayer(this.program).publicKey;
+    const opcode = 0;
+
+    // Create the quote program verified_update instruction
+    const quoteProgramIx = new web3.TransactionInstruction({
+      programId: QUOTE_PROGRAM_ID,
+      keys: [
+        { pubkey: this.pubkey, isSigner: false, isWritable: false }, // queue_account [0]
+        { pubkey: oracleAccount, isSigner: false, isWritable: true }, // oracle_account [1]
+        {
+          pubkey: SPL_SYSVAR_INSTRUCTIONS_ID,
+          isSigner: false,
+          isWritable: false,
+        }, // ix_sysvar [2]
+        {
+          pubkey: SPL_SYSVAR_SLOT_HASHES_ID,
+          isSigner: false,
+          isWritable: false,
+        }, // slot_sysvar [3]
+        {
+          pubkey: web3.SYSVAR_CLOCK_PUBKEY,
+          isSigner: false,
+          isWritable: false,
+        }, // clock_sysvar [4]
+        { pubkey: payer, isSigner: true, isWritable: true }, // payer [5]
+        {
+          pubkey: web3.SystemProgram.programId,
+          isSigner: false,
+          isWritable: false,
+        }, // system_program [6]
+      ],
+      data: Buffer.from([opcode, config.instructionIdx ?? 0, bump]), // ix_idx - index of Ed25519 instruction in transaction
+    });
+
+    return [ed25519Ix, quoteProgramIx];
   }
-
-  return Buffer.concat(buffers);
 }

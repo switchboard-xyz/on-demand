@@ -180,6 +180,7 @@ export class Randomness {
   async revealIx(
     payer_?: web3.PublicKey
   ): Promise<web3.TransactionInstruction> {
+    await new Promise(f => setTimeout(f, 3000));
     const payer = Randomness.getPayer(this.program, payer_);
     const data = await this.loadData();
 

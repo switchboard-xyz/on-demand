@@ -32,10 +32,15 @@
  * import * as sb from '@switchboard-xyz/on-demand';
  *
  * // Fetch and verify price in your transaction
- * const [pullIx, bundle] = await queue.fetchUpdateBundleIx(
+ * const pullIx = await queue.fetchQuoteIx(
  *   gateway,
  *   crossbar,
- *   ['0xabc123...'] // Feed hashes
+ *   ['0xabc123...'], // Feed hashes
+ *   {
+ *     numSignatures: 1,
+ *     variableOverrides: {},
+ *     instructionIdx: 0
+ *   }
  * );
  *
  * // Add to your transaction

@@ -7,8 +7,10 @@ import {
   SPL_TOKEN_PROGRAM_ID,
 } from '../constants.js';
 import { InstructionUtils } from '../instruction-utils/InstructionUtils.js';
-import type { Secp256k1Signature } from '../instruction-utils/Secp256k1InstructionUtils.js';
-import { Secp256k1InstructionUtils } from '../instruction-utils/Secp256k1InstructionUtils.js';
+import {
+  Secp256k1InstructionUtils,
+  type Secp256k1Signature,
+} from '../instruction-utils/Secp256k1InstructionUtils.js';
 import type {
   FeedEvalResponse,
   FeedRequest,
@@ -172,7 +174,7 @@ async function checkNeedsInit(
  * PullFeed account management for persistent price feeds
  *
  * The PullFeed class manages on-chain feed accounts that store price
- * history and configuration. While the bundle approach is more efficient
+ * history and configuration. While the quote approach is more efficient
  * for most use cases, feeds are useful when you need:
  *
  * - Persistent price history on-chain
@@ -569,6 +571,7 @@ export class PullFeed {
    * @param {string} params.chain - Chain identifier
    * @param {string} params.network - Network (mainnet/devnet)
    * @param {string} params.solanaRpcUrl - Optional RPC URL override
+   * @param {Record<string, string>} params.variableOverrides - Optional variable overrides for task execution
    * @param {boolean} debug - Enable debug logging
    * @param {web3.PublicKey} payer - Optional payer override
    * @returns {Promise<[instructions, responses, success, luts, logs]>} Update transaction components
@@ -601,6 +604,7 @@ export class PullFeed {
       chain?: string;
       network?: 'mainnet' | 'mainnet-beta' | 'testnet' | 'devnet';
       solanaRpcUrl?: string;
+      variableOverrides?: Record<string, string>;
     },
     debug: boolean = false,
     payer?: web3.PublicKey
@@ -627,12 +631,12 @@ export class PullFeed {
         numSignatures: numSignatures,
         crossbarClient: params.crossbarClient,
         solanaRpcUrl: params.solanaRpcUrl,
+        variableOverrides: params.variableOverrides,
       },
       debug,
       payer
     );
   }
-
   /**
    * Loads the feed configurations (if not already cached) for this {@linkcode PullFeed} account from on chain.
    * @returns A promise that resolves to the feed configurations.
@@ -679,7 +683,7 @@ export class PullFeed {
    * @param payer - Optional transaction payer public key
    * @returns Promise resolving to:
    * - instructions: Array of instructions that must be executed in order:
-   *   [0] = secp256k1 program verification instruction
+   *   [0] = Ed25519 program verification instruction
    *   [1] = feed update instruction
    * - oracleResponses: Array of responses from oracles
    * - numSuccesses: Number of successful responses
@@ -695,6 +699,7 @@ export class PullFeed {
       numSignatures: number;
       crossbarClient?: CrossbarClient;
       solanaRpcUrl?: string;
+      variableOverrides?: Record<string, string>;
     },
     debug?: boolean,
     payer?: web3.PublicKey
@@ -726,6 +731,7 @@ export class PullFeed {
         numSignatures: params.numSignatures,
         crossbarClient: params.crossbarClient,
         payer: payer,
+        variableOverrides: params.variableOverrides,
       },
       debug
     );
@@ -779,6 +785,7 @@ export class PullFeed {
       crossbarClient?: CrossbarClient;
       solanaRpcUrl?: string;
       recentSlothashes?: Array<[BN, string]>;
+      variableOverrides?: Record<string, string>;
     },
     debug?: boolean,
     payer?: web3.PublicKey
@@ -828,6 +835,7 @@ export class PullFeed {
       numSignatures: params.numSignatures,
       jobs: jobs,
       queue: solanaQueuePubkey,
+      variableOverrides: params.variableOverrides,
     });
 
     const oracleResponses = responses.map(resp => {
@@ -892,7 +900,7 @@ export class PullFeed {
 
   /**
    * Fetches updates for multiple feeds at once into a SINGLE tightly packed instruction.
-   * Returns instructions that must be executed in order, with the secp256k1 verification
+   * Returns instructions that must be executed in order, with the Ed25519 verification
    * instruction placed at the front of the transaction.
    *
    * @param program - The Anchor program instance.
@@ -906,7 +914,7 @@ export class PullFeed {
    * @param debug - A boolean flag to enable or disable debug mode. Defaults to `false`.
    * @returns A promise that resolves to a tuple containing:
    * - An array of transaction instructions that must be executed in order:
-   *   [0] = secp256k1 program verification instruction
+   *   [0] = Ed25519 program verification instruction
    *   [1] = feed update instruction
    * - An array of `AddressLookupTableAccount` to use.
    * - The raw response data.
@@ -921,6 +929,8 @@ export class PullFeed {
       numSignatures: number;
       crossbarClient?: CrossbarClient;
       payer?: web3.PublicKey;
+      variableOverrides?: Record<string, string>;
+      signatureInstructionIdx?: number; // position of the secp256k1 instruction in the transaction
     },
     debug: boolean = false
   ): Promise<
@@ -980,6 +990,7 @@ export class PullFeed {
         gateway: params.gateway,
         feedConfigs,
         numSignatures: params.numSignatures,
+        // useEd25519 will default to false (secp256k1) for backward compatibility
       }
     );
 
@@ -999,14 +1010,17 @@ export class PullFeed {
     });
 
     const secpSignatures: Secp256k1Signature[] =
-      response.oracle_responses.map<Secp256k1Signature>(oracleResponse => {
-        return {
-          ethAddress: Buffer.from(oracleResponse.eth_address, 'hex'),
-          signature: Buffer.from(oracleResponse.signature, 'base64'),
-          message: Buffer.from(oracleResponse.checksum, 'base64'),
-          recoveryId: oracleResponse.recovery_id,
-        };
-      });
+      response.oracle_responses.map<Secp256k1Signature>(
+        (oracleResponse, responseIdx) => {
+          return {
+            ethAddress: Buffer.from(oracleResponse.eth_address, 'hex'),
+            signature: Buffer.from(oracleResponse.signature, 'base64'),
+            message: Buffer.from(oracleResponse.checksum, 'base64'),
+            recoveryId: oracleResponse.recovery_id,
+            oracleIdx: responseIdx,
+          };
+        }
+      );
 
     // Check if we have any valid signatures before calling buildSecp256k1Instruction
     if (secpSignatures.length === 0) {
@@ -1019,7 +1033,7 @@ export class PullFeed {
 
     const secpInstruction = Secp256k1InstructionUtils.buildSecp256k1Instruction(
       secpSignatures,
-      0
+      params.signatureInstructionIdx ?? 0
     );
 
     // Prepare the instruction data for the `pullFeedSubmitResponseManySecp` instruction.
@@ -1118,6 +1132,7 @@ export class PullFeed {
       numSignatures: number;
       crossbarClient?: CrossbarClient;
       payer?: web3.PublicKey;
+      variableOverrides?: Record<string, string>;
     },
     debug: boolean = false
   ): Promise<
@@ -1171,6 +1186,8 @@ export class PullFeed {
         gateway: params.gateway,
         feedConfigs,
         numSignatures: params.numSignatures,
+        variableOverrides: params.variableOverrides,
+        // useEd25519 will default to false (secp256k1) for backward compatibility
       }
     );
 
@@ -1190,14 +1207,17 @@ export class PullFeed {
     });
 
     const secpSignatures: Secp256k1Signature[] =
-      response.oracle_responses.map<Secp256k1Signature>(oracleResponse => {
-        return {
-          ethAddress: Buffer.from(oracleResponse.eth_address, 'hex'),
-          signature: Buffer.from(oracleResponse.signature, 'base64'),
-          message: Buffer.from(oracleResponse.checksum, 'base64'),
-          recoveryId: oracleResponse.recovery_id,
-        };
-      });
+      response.oracle_responses.map<Secp256k1Signature>(
+        (oracleResponse, responseIdx) => {
+          return {
+            ethAddress: Buffer.from(oracleResponse.eth_address, 'hex'),
+            signature: Buffer.from(oracleResponse.signature, 'base64'),
+            message: Buffer.from(oracleResponse.checksum, 'base64'),
+            recoveryId: oracleResponse.recovery_id,
+            oracleIdx: responseIdx,
+          };
+        }
+      );
 
     // Check if we have any valid signatures before calling buildSecp256k1Instruction
     if (secpSignatures.length === 0) {
@@ -1931,8 +1951,11 @@ export class PullFeed {
           }
           return new anchor.BN(x.success_value);
         }),
-        signature: Buffer.from(oracleResponse.signature, 'base64'),
-        recoveryId: oracleResponse.recovery_id,
+        signature: Buffer.from(
+          oracleResponse.signature, // Use oracle-level signature (not feed-level)
+          'base64'
+        ),
+        recoveryId: oracleResponse.feed_responses[0].recovery_id,
       };
       submissions.push(multisSubmission);
     }

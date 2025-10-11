@@ -1,0 +1,2407 @@
+import { Queue } from '../accounts/queue.js';
+import { Ed25519InstructionUtils } from '../instruction-utils/Ed25519InstructionUtils.js';
+import type { Secp256k1Signature } from '../instruction-utils/Secp256k1InstructionUtils.js';
+import { Secp256k1InstructionUtils } from '../instruction-utils/Secp256k1InstructionUtils.js';
+import { Gateway } from '../oracle-interfaces/gateway.js';
+
+import { Source } from './source.js';
+
+import { BN, web3 } from '@coral-xyz/anchor-31';
+import { CrossbarClient } from '@switchboard-xyz/common';
+import axios from 'axios';
+import { Buffer } from 'buffer';
+import { EventEmitter } from 'events';
+import WebSocket from 'isomorphic-ws';
+
+/**
+ * Raw gateway response structure (matches actual BundledFeedUpdate from server)
+ */
+interface RawGatewayResponse {
+  type: string;
+  feed_bundle_id?: string;
+  feed_values?: Array<{
+    value: string;
+    feed_hash: string;
+  }>;
+  oracle_response?: {
+    oracle_pubkey: string;
+    eth_address: string;
+    signature: string;
+    checksum: string;
+    recovery_id: number;
+    oracle_idx: number;
+    timestamp: number;
+    timestamp_ms?: number;
+    recent_hash: string;
+    slot: number;
+    // Ed25519 enclave signer pubkey (for Ed25519 signature verification)
+    ed25519_enclave_signer?: string;
+  };
+  source_ts_ms: number;
+  seen_at_ts_ms: number;
+  triggered_on_price_change: boolean;
+  message?: string;
+}
+
+/**
+ * Raw unsigned price update structure (matches actual UnsignedPriceUpdate from server)
+ */
+interface RawUnsignedPriceUpdate {
+  type: 'UnsignedPriceUpdate';
+  feed_bundle_id: string;
+  feed_values: Array<{
+    value: string;
+    feed_id: string;
+    symbol: string;
+    source: string;
+    source_ts_ms: number;
+    seen_at_ts_ms: number;
+  }>;
+  broadcast_ts_ms: number;
+  message?: string;
+}
+
+/**
+ * WebSocket message types for subscription confirmations
+ */
+interface SubscribedMessage {
+  type: 'Subscribed';
+  message?: string;
+  feed_bundles?: Array<{
+    feed_bundle_id: string;
+    feeds: Array<{
+      symbol: string | { base: string; quote: string };
+      source: string;
+    }>;
+  }>;
+}
+
+interface AuthenticatedMessage {
+  type: 'Authenticated';
+  message?: string;
+}
+
+/**
+ * Validation error message type
+ */
+interface ValidationErrorMessage {
+  type: 'ValidationError';
+  message?: string;
+  error?: string;
+  invalid_feeds?: Array<{
+    symbol: {
+      base: string;
+      quote: string;
+    };
+    source: string;
+    error: string;
+  }>;
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Union type for all WebSocket message types
+ */
+type WebSocketMessage =
+  | RawGatewayResponse
+  | RawUnsignedPriceUpdate
+  | SubscribedMessage
+  | AuthenticatedMessage
+  | ValidationErrorMessage;
+
+/**
+ * Oracle response class that wraps raw gateway responses with convenient methods
+ */
+export class SurgeUpdate {
+  private readonly rawResponse: RawGatewayResponse;
+
+  constructor(rawResponse: RawGatewayResponse) {
+    this.rawResponse = rawResponse;
+  }
+
+  get data(): RawGatewayResponse {
+    return this.rawResponse;
+  }
+
+  /**
+   * Get array of signed feed hashes
+   */
+  getSignedFeeds(): string[] {
+    if (!this.rawResponse.feed_values) return [];
+    return this.rawResponse.feed_values.map(feed => feed.feed_hash);
+  }
+
+  /**
+   * Get array of price values (raw 18-decimal format)
+   */
+  getValues(): string[] {
+    if (!this.rawResponse.feed_values) return [];
+    return this.rawResponse.feed_values.map(feed => feed.value);
+  }
+
+  /**
+   * Get formatted prices as readable dollar amounts
+   */
+  getFormattedPrices(): Record<string, string> {
+    if (!this.rawResponse.feed_values) return {};
+
+    const prices: Record<string, string> = {};
+    this.rawResponse.feed_values.forEach(feed => {
+      const value = BigInt(feed.value);
+      const divisor = BigInt(10 ** 18);
+      const wholePart = value / divisor;
+      const fractionalPart = value % divisor;
+
+      // Convert to full decimal representation without losing precision
+      const fullDecimal = fractionalPart.toString().padStart(18, '0');
+
+      // Remove trailing zeros to show only significant digits
+      const decimals = fullDecimal.replace(/0+$/, '') || '0';
+
+      const wholeStr = wholePart
+        .toString()
+        .replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+      // Use full precision instead of truncating to 2 decimals
+      prices[feed.feed_hash] =
+        decimals === '0' ? `$${wholeStr}` : `$${wholeStr}.${decimals}`;
+    });
+
+    return prices;
+  }
+
+  /**
+   * Check if this update was triggered by a price change (vs heartbeat)
+   */
+  isTriggeredByPriceChange(): boolean {
+    return this.rawResponse.triggered_on_price_change === true;
+  }
+
+  /**
+   * Get the complete raw response from gateway
+   */
+  getRawResponse(): RawGatewayResponse {
+    return this.rawResponse;
+  }
+
+  /**
+   * Get detailed latency breakdown for this oracle response
+   *
+   * Note: For heartbeat updates (triggered_on_price_change=false), the oracleProcessing
+   * metric is not meaningful since heartbeats are generated by the oracle itself rather
+   * than processing external price data.
+   */
+  getLatencyMetrics(): {
+    exchangeToOracleUpdate: number | string;
+    oracleUpdateToClient: number | string;
+    endToEnd: number | string;
+    isScheduledPriceHeartbeat: boolean;
+  } {
+    const sourceTimeMs = this.rawResponse.source_ts_ms;
+    const arrivalTimeMs = Date.now();
+    const checksumTimeMs =
+      this.rawResponse.oracle_response?.timestamp_ms ||
+      (this.rawResponse.oracle_response?.timestamp ?? 0) * 1000;
+
+    const isHeartbeat = this.rawResponse.triggered_on_price_change === false;
+    // Calculate raw values
+    const oracleToClientRaw = arrivalTimeMs - checksumTimeMs;
+    const endToEndRaw = arrivalTimeMs - sourceTimeMs;
+    const exchangeToChecksumRaw = checksumTimeMs - sourceTimeMs;
+
+    // Helper function to handle negative values (clock drift)
+    const handleClockDrift = (value: number): number | string => {
+      if (value < 0) {
+        return `${value}ms (clock drift detected)`;
+      }
+      return value;
+    };
+
+    return {
+      exchangeToOracleUpdate: handleClockDrift(exchangeToChecksumRaw),
+      oracleUpdateToClient: handleClockDrift(oracleToClientRaw),
+      endToEnd: handleClockDrift(endToEndRaw),
+      isScheduledPriceHeartbeat: isHeartbeat,
+    };
+  }
+
+  /**
+   * Convert to Solana bundle instruction supporting both signature schemes
+   * - Ed25519 (default): Returns single TransactionInstruction
+   * - Secp256k1 (backwards compat): Returns [TransactionInstruction, Buffer] tuple
+   *
+   * @param instructionIdx - The instruction index (defaults to 0)
+   * @returns Transaction instruction or [instruction, bundleData] tuple depending on signature scheme
+   */
+  toBundleIx(
+    instructionIdx: number = 0
+  ): web3.TransactionInstruction | [web3.TransactionInstruction, Buffer] {
+    const response = this.rawResponse;
+
+    // Check if oracle_response exists
+    if (!response.oracle_response) {
+      throw new Error('No oracle response available for creating signatures');
+    }
+
+    // Check which signature type to use based on available fields
+    if (response.oracle_response.ed25519_enclave_signer) {
+      // Ed25519 path (new default) - matches Ed25519 v0 scheme
+      let pubkeyHex = response.oracle_response.ed25519_enclave_signer;
+
+      // If ed25519_enclave_signer is 64 bytes (128 hex chars), extract the first 32 bytes for Ed25519 pubkey
+      if (pubkeyHex && pubkeyHex.length === 128) {
+        pubkeyHex = pubkeyHex.substring(0, 64); // First 32 bytes (64 hex chars)
+      }
+
+      // Build the Ed25519 signature object
+      const ed25519Signature = {
+        pubkey: Buffer.from(pubkeyHex, 'hex'), // Ed25519 pubkey (32 bytes)
+        signature: Buffer.from(response.oracle_response.signature, 'base64'), // Signature
+        message: Buffer.from(response.oracle_response.checksum, 'base64'), // Message is the checksum for Ed25519
+        oracleIdx: response.oracle_response.oracle_idx, // Oracle index
+      };
+
+      // Build the Ed25519 instruction
+      const ed25519Instruction =
+        Ed25519InstructionUtils.buildEd25519Instruction(
+          [ed25519Signature],
+          instructionIdx,
+          response.oracle_response.slot, // recent_slot from oracle response
+          0 // version 0 for Ed25519 v0 scheme
+        );
+
+      return ed25519Instruction;
+    } else {
+      // Secp256k1 path (backwards compatibility)
+      const oracleResponse = response.oracle_response;
+
+      // Create SECP256k1 signature (following exact fetchUpdateBundleIx pattern)
+      const secpSignatures: Secp256k1Signature[] = [
+        {
+          ethAddress: Buffer.from(oracleResponse.eth_address, 'hex'),
+          signature: Buffer.from(oracleResponse.signature, 'base64'),
+          message: Buffer.from(oracleResponse.checksum, 'base64'),
+          recoveryId: oracleResponse.recovery_id,
+          oracleIdx: oracleResponse.oracle_idx,
+        },
+      ];
+
+      const secpInstruction =
+        Secp256k1InstructionUtils.buildSecp256k1Instruction(
+          secpSignatures,
+          instructionIdx
+        );
+
+      // Prepare the bundle data (simplified version for Surge compatibility)
+      const data = {
+        slotLower: Number(response.oracle_response.slot) & 0xff,
+        feedInfos:
+          response.feed_values?.map(feed => ({
+            value: new BN(feed.value),
+            checksum: Buffer.from(feed.feed_hash, 'hex'),
+            numOracles: 1, // Single oracle response
+          })) || [],
+      };
+
+      // Create a minimal bundle data buffer for compatibility
+      const bundleDataLength = 1 + data.feedInfos.length * (16 + 32 + 1); // slot + (value + checksum + numOracles) per feed
+      const bundleData = Buffer.alloc(bundleDataLength);
+      let offset = 0;
+
+      // Write slot lower byte
+      bundleData.writeUInt8(data.slotLower, offset);
+      offset += 1;
+
+      // Write feed infos
+      for (const feedInfo of data.feedInfos) {
+        // Write value as 16 bytes LE
+        const valueBytes = feedInfo.value.toArrayLike(Buffer, 'le', 16);
+        valueBytes.copy(bundleData, offset);
+        offset += 16;
+
+        // Write checksum (32 bytes)
+        feedInfo.checksum.copy(bundleData, offset);
+        offset += 32;
+
+        // Write numOracles (1 byte)
+        bundleData.writeUInt8(feedInfo.numOracles, offset);
+        offset += 1;
+      }
+
+      return [secpInstruction, bundleData];
+    }
+  }
+}
+
+/**
+ * Unsigned price update class that wraps raw unsigned price updates with convenient methods
+ */
+export class UnsignedPriceUpdate {
+  private readonly rawResponse: RawUnsignedPriceUpdate;
+
+  constructor(rawResponse: RawUnsignedPriceUpdate) {
+    this.rawResponse = rawResponse;
+  }
+
+  get data(): RawUnsignedPriceUpdate {
+    return this.rawResponse;
+  }
+
+  /**
+   * Get array of feed IDs
+   */
+  getFeedIds(): string[] {
+    return this.rawResponse.feed_values.map(feed => feed.feed_id);
+  }
+
+  /**
+   * Get array of price values (raw format)
+   */
+  getPrices(): string[] {
+    return this.rawResponse.feed_values.map(feed => feed.value);
+  }
+
+  /**
+   * Get array of symbols
+   */
+  getSymbols(): string[] {
+    return this.rawResponse.feed_values.map(feed => feed.symbol);
+  }
+
+  /**
+   * Get array of sources
+   */
+  getSources(): string[] {
+    return this.rawResponse.feed_values.map(feed => feed.source);
+  }
+
+  /**
+   * Get formatted prices as readable dollar amounts
+   */
+  getFormattedPrices(): Record<string, string> {
+    const prices: Record<string, string> = {};
+    this.rawResponse.feed_values.forEach(feed => {
+      const value = BigInt(feed.value);
+      const divisor = BigInt(10 ** 18);
+      const wholePart = value / divisor;
+      const fractionalPart = value % divisor;
+
+      // Convert to full decimal representation without losing precision
+      const fullDecimal = fractionalPart.toString().padStart(18, '0');
+
+      // Remove trailing zeros to show only significant digits
+      const decimals = fullDecimal.replace(/0+$/, '') || '0';
+
+      const wholeStr = wholePart
+        .toString()
+        .replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      prices[feed.symbol] = `$${wholeStr}.${decimals}`;
+    });
+
+    return prices;
+  }
+
+  /**
+   * Get the complete raw response
+   */
+  getRawResponse(): RawUnsignedPriceUpdate {
+    return this.rawResponse;
+  }
+
+  /**
+   * Get feed bundle ID
+   */
+  getFeedBundleId(): string {
+    return this.rawResponse.feed_bundle_id;
+  }
+
+  /**
+   * Get latency metrics for all feeds in this update
+   */
+  getLatencyMetrics(): Array<{
+    symbol: string;
+    source: string;
+    exchangeToBroadcast: number | string;
+    broadcastToClient: number | string;
+    endToEnd: number | string;
+  }> {
+    const currentTimeMs = Date.now();
+    const broadcastTs = this.rawResponse.broadcast_ts_ms;
+
+    return this.rawResponse.feed_values.map(feed => {
+      const exchangeToBroadcastRaw = broadcastTs - feed.source_ts_ms;
+      const broadcastToClientRaw = currentTimeMs - broadcastTs;
+      const endToEndRaw = currentTimeMs - feed.source_ts_ms;
+
+      // Helper function to handle negative values (clock drift)
+      const handleClockDrift = (value: number): number | string => {
+        if (value < 0) {
+          return `${value}ms (clock drift detected)`;
+        }
+        return value;
+      };
+
+      return {
+        symbol: feed.symbol,
+        source: feed.source,
+        exchangeToBroadcast: handleClockDrift(exchangeToBroadcastRaw),
+        broadcastToClient: handleClockDrift(broadcastToClientRaw),
+        endToEnd: handleClockDrift(endToEndRaw),
+      };
+    });
+  }
+
+  /**
+   * Get latency metrics for a specific symbol and source
+   */
+  getLatencyMetricsFor(
+    symbol: string,
+    source: string
+  ): {
+    exchangeToHub: number | string;
+    hubToBroadcast: number | string;
+    broadcastToClient: number | string;
+    endToEnd: number | string;
+  } | null {
+    const feed = this.rawResponse.feed_values.find(
+      f => f.symbol === symbol && f.source === source
+    );
+
+    if (!feed) {
+      return null;
+    }
+
+    const currentTimeMs = Date.now();
+    const broadcastTs = this.rawResponse.broadcast_ts_ms;
+
+    const exchangeToHubRaw = feed.seen_at_ts_ms - feed.source_ts_ms;
+    const hubToBroadcastRaw = broadcastTs - feed.seen_at_ts_ms;
+    const broadcastToClientRaw = currentTimeMs - broadcastTs;
+    const endToEndRaw = currentTimeMs - feed.source_ts_ms;
+
+    // Helper function to handle negative values (clock drift)
+    const handleClockDrift = (value: number): number | string => {
+      if (value < 0) {
+        return `${value}ms (clock drift detected)`;
+      }
+      return value;
+    };
+
+    return {
+      exchangeToHub: handleClockDrift(exchangeToHubRaw),
+      hubToBroadcast: handleClockDrift(hubToBroadcastRaw),
+      broadcastToClient: handleClockDrift(broadcastToClientRaw),
+      endToEnd: handleClockDrift(endToEndRaw),
+    };
+  }
+}
+
+/**
+ * Supported exchange sources for streaming (dynamically fetched from gateway)
+ */
+export type StreamingSource = Source;
+
+/**
+ * Pair structure matching the Rust Pair struct
+ */
+export interface Pair {
+  base: string;
+  quote: string;
+}
+
+/**
+ * Utility functions for Pair conversion
+ */
+function stringToPair(symbol: string): Pair {
+  const [base, quote] = symbol.split('/');
+  if (!base || !quote) {
+    throw new Error(`Invalid symbol format: ${symbol}. Expected BASE/QUOTE`);
+  }
+  return { base: base.toUpperCase(), quote: quote.toUpperCase() };
+}
+
+function pairToString(pair: Pair): string {
+  return `${pair.base}/${pair.quote}`;
+}
+
+/**
+ * Individual feed entry from the gateway
+ */
+export interface SurgeFeedEntry {
+  source: string;
+  feed_id: string;
+}
+
+/**
+ * Symbol group containing feeds from different sources
+ */
+export interface SurgeSymbolGroup {
+  symbol: Pair; // Changed from string to Pair
+  feeds: SurgeFeedEntry[];
+}
+
+/**
+ * Response from surge_feeds endpoint (actual API structure)
+ */
+export interface SurgeFeedsResponse {
+  total: number;
+  data: SurgeSymbolGroup[];
+}
+
+/**
+ * Feed subscription input - can be symbol/source pair or feedHash, default source to 'WEIGHTED'
+ */
+export type SymbolSubscription = { symbol: string; source?: StreamingSource };
+export type FeedSubscription = SymbolSubscription | { feedHash: string };
+
+/**
+ * Raw streaming response data from WebSocket
+ */
+export interface StreamingRawResponse {
+  type: 'price_update' | 'bundle_update';
+  data: Record<string, unknown>; // Raw WebSocket message
+  timestamp: number;
+}
+
+/**
+ * Processed streaming response ready for Solana transactions
+ */
+export interface StreamingProcessedResponse {
+  instruction: web3.TransactionInstruction;
+  bundleData: Buffer;
+  feedHashes: string[];
+  values: string[];
+  timestamp: number;
+}
+
+/**
+ * Combined streaming response with both raw and processed data
+ */
+export interface StreamingResponse {
+  raw: StreamingRawResponse;
+  processed: StreamingProcessedResponse;
+}
+
+/**
+ * Error types for streaming operations
+ */
+export interface StreamingError {
+  type: 'auth' | 'connection' | 'subscription' | 'processing' | 'validation';
+  message: string;
+  code?: string;
+  retryable: boolean;
+}
+
+/**
+ * Configuration options for Surge
+ */
+export interface SurgeConfig {
+  /** API key for authentication */
+  apiKey: string;
+  /** Chain identifier (defaults to "solana") */
+  chain?: string;
+  /** Network identifier */
+  network?: 'mainnet' | 'mainnet-beta' | 'testnet' | 'devnet';
+  /** Optional queue for gateway discovery */
+  queue?: Queue;
+  /** Optional gateway URL override */
+  gatewayUrl?: string;
+  /** Optional crossbar client */
+  crossbarClient?: CrossbarClient;
+  /** Optional crossbar URL override (used in crossbar mode) */
+  crossbarUrl?: string;
+  /** Signature scheme to use (defaults to 'ed25519') */
+  signatureScheme?: 'secp256k1' | 'ed25519';
+  /** Auto-reconnect on connection loss (defaults to true) */
+  autoReconnect?: boolean;
+  /** Maximum reconnection attempts (defaults to 5) */
+  maxReconnectAttempts?: number;
+  /** Reconnection delay in ms (defaults to 1000) */
+  reconnectDelay?: number;
+  /** Verbose flag for added logging */
+  verbose?: boolean;
+  /** Enable crossbar mode (defaults to false) */
+  crossbarMode?: boolean; // ✅ Add this flag
+}
+
+/**
+ * Internal feed data for processing
+ */
+interface ProcessedFeedData {
+  feedHash?: string; // Optional - only for feedHash subscriptions
+  symbol: string;
+  source: StreamingSource;
+  batchIntervalMs?: number;
+}
+
+/**
+ * WebSocket connection states
+ */
+type ConnectionState =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'authenticating'
+  | 'authenticated'
+  | 'error';
+
+/**
+ * Surge - WebSocket streaming client for Switchboard On-Demand feeds
+ *
+ * Provides real-time streaming of price updates with automatic processing into
+ * Solana transaction instructions. Supports both direct symbol/source subscriptions
+ * and feedHash-based subscriptions with automatic detection and conversion.
+ *
+ * @example
+ * ```typescript
+ * const surge = new Surge({
+ *   apiKey: "sb_live_...",
+ *   network: "mainnet"
+ * });
+ *
+ * // Subscribe to symbol/source pairs
+ * await surge.subscribe([
+ *   { symbol: "BTCUSDT", source: "BINANCE" },
+ *   { symbol: "ETHUSDT", source: "WEIGHTED" }
+ * ]);
+ *
+ * surge.on('update', (response: SwitchboardOracleResponse) => {
+ *   console.log('Raw:', response.getRawResponse());
+ *   console.log('Formatted prices:', response.getFormattedPrices());
+ * });
+ * ```
+ */
+export class Surge extends EventEmitter {
+  private readonly config: SurgeConfig;
+  private ws: WebSocket | null = null;
+  private connectionState: ConnectionState = 'disconnected';
+  private sessionToken: string | null = null;
+  private subscriptions: Map<string, ProcessedFeedData> = new Map();
+  private bundleIdToFeeds: Map<string, FeedSubscription[]> = new Map(); // Track bundle IDs for oracle mode
+  private feedToBundleId: Map<string, string> = new Map(); // Map feed key to bundle ID
+  private reconnectAttempts = 0;
+  private detectedClientIp?: string;
+  private sessionClientIp?: string; // IP actually used for session creation
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private gateway: Gateway | null = null;
+  private crossbar: CrossbarClient;
+  private authenticationPromise: Promise<void> | null = null;
+  private authenticationResolve: (() => void) | null = null;
+  private sessionData: { session_token: string; ws_url: string } | null = null;
+
+  /**
+   * Create a new Surge instance
+   */
+  constructor(config: SurgeConfig) {
+    super();
+
+    this.config = {
+      chain: 'solana',
+      network: 'mainnet-beta',
+      autoReconnect: true,
+      maxReconnectAttempts: 5,
+      reconnectDelay: 1000,
+      ...config,
+    };
+
+    // Initialize crossbar client with default URL
+    this.crossbar = config.crossbarClient || CrossbarClient.default();
+
+    this.setupEventEmitters();
+  }
+
+  /**
+   * Set up internal event emitters
+   */
+  private setupEventEmitters(): void {
+    this.on('error', (error: StreamingError) => {
+      console.error('Surge Error:', error);
+      if (error.retryable && this.config.autoReconnect) {
+        this.scheduleReconnection();
+      }
+    });
+  }
+  /**
+   * Private logging conditional helper
+   */
+  private log(message: string): void {
+    if (this.config.verbose) {
+      console.log(`[Surge] ${message}`);
+    }
+  }
+
+  /**
+   * Request a session token from the gateway (following bundle_verbose_test.ts pattern)
+   * @param feedHints Optional feeds for oracle selection
+   */
+  private async requestSession(feedHints?: FeedSubscription[]): Promise<{
+    session_token: string;
+    ws_url: string;
+  }> {
+    const maxRetries = 3;
+    const baseDelay = 1000; // 1 second
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.attemptSessionRequest(attempt, maxRetries, feedHints);
+      } catch (error) {
+        const isRetryable = this.isRetryableSessionError(error);
+
+        // If this is the last attempt or not retryable, throw
+        if (attempt === maxRetries || !isRetryable) {
+          throw error;
+        }
+
+        // Wait before retrying with exponential backoff
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        this.log(`⏳ Retrying session request in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    throw new Error('Session request failed after all retry attempts');
+  }
+
+  /**
+   * Single attempt to request session
+   * @param feedHints Optional feeds for oracle selection
+   */
+  private async attemptSessionRequest(
+    attempt: number,
+    maxRetries: number,
+    feedHints?: FeedSubscription[]
+  ): Promise<{
+    session_token: string;
+    ws_url: string;
+  }> {
+    let gatewayUrl: string;
+
+    if (this.config.crossbarMode) {
+      // Use CrossbarClient to get the gateway URL for crossbar mode
+      gatewayUrl = this.config.gatewayUrl || this.config.crossbarUrl || '';
+    } else {
+      // Use provided URL or default for oracle mode
+      gatewayUrl = this.config.gatewayUrl || 'https://gateway.switchboard.dev';
+    }
+
+    // Use different endpoints based on mode
+    const requestUrl = this.config.crossbarMode
+      ? `${gatewayUrl}/stream/request_session` // ✅ Crossbar endpoint
+      : `${gatewayUrl}/gateway/api/v1/request_stream`; // Oracle endpoint
+
+    this.log(
+      `🔑 Requesting session from: ${requestUrl} (attempt ${attempt}/${maxRetries})`
+    );
+
+    // Build request body
+    let requestBody: Record<string, unknown> = {};
+
+    // Add feeds for oracle mode (for smart oracle selection)
+    if (!this.config.crossbarMode && feedHints && feedHints.length > 0) {
+      // Convert FeedSubscription to request format
+      const feeds = feedHints
+        .map(feed => {
+          if ('feedHash' in feed) {
+            // Skip feedHash - can't use for oracle selection
+            return null;
+          }
+          // Convert Source enum to string for Rust endpoint (matches subscribe behavior)
+          const sourceStr = Source.toString(feed.source || Source.AUTO);
+
+          return {
+            symbol: feed.symbol,
+            source: sourceStr,
+          };
+        })
+        .filter(f => f !== null);
+
+      if (feeds.length > 0) {
+        requestBody.feeds = feeds;
+        this.log(`📊 Including ${feeds.length} feeds for oracle selection`);
+      }
+    }
+
+    if (this.config.crossbarMode) {
+      // Check if we're not on localhost
+      // const isLocalhost =
+      //   gatewayUrl.includes('localhost') || gatewayUrl.includes('127.0.0.1');
+
+      // if (!isLocalhost) {
+      // if (true) {
+      // Always run IP detection to mimic production behavior
+      try {
+        // Always try to detect current IP first (handles IP changes)
+        const ipResponse = await axios.get(
+          'https://api.ipify.org?format=json',
+          { timeout: 2000 }
+        );
+        const clientIp = ipResponse.data.ip;
+
+        // Log if IP changed
+        if (this.detectedClientIp && this.detectedClientIp !== clientIp) {
+          this.log(
+            `🔄 Client IP changed: ${this.detectedClientIp} -> ${clientIp}`
+          );
+        }
+
+        requestBody = { client_ip: clientIp };
+        this.detectedClientIp = clientIp;
+        this.sessionClientIp = clientIp; // Track IP used for session
+        this.log(`🌐 Using client IP: ${clientIp}`);
+      } catch {
+        // Fallback to previously detected IP if available
+        if (this.detectedClientIp) {
+          requestBody = { client_ip: this.detectedClientIp };
+          this.sessionClientIp = this.detectedClientIp; // Track IP used for session
+          this.log(
+            `⚠️ IP detection failed, using cached IP: ${this.detectedClientIp}`
+          );
+        } else {
+          this.log(
+            '⚠️ Could not detect client IP and no cached IP available, proceeding without it'
+          );
+          this.sessionClientIp = undefined; // No IP sent with session
+        }
+        // }
+      } // End of IP detection block
+    }
+
+    const response = await axios.post(requestUrl, requestBody, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': this.config.apiKey,
+      },
+    });
+
+    const sessionData: { session_token: string; ws_url: string } = this.config
+      .crossbarMode
+      ? {
+          session_token: response.data.session_token,
+          ws_url: response.data.simulator_ws_url,
+        }
+      : {
+          session_token: response.data.session_token,
+          ws_url: response.data.oracle_ws_url,
+        };
+    this.log(
+      `✅ Session obtained: ${sessionData.session_token?.substring(0, 8)}...`
+    );
+    return sessionData;
+  }
+
+  /**
+   * Determine if a session error is retryable
+   */
+  private isRetryableSessionError(error: unknown): boolean {
+    if (axios.isAxiosError(error)) {
+      const status = error.response?.status;
+      const responseData = error.response?.data;
+      const message =
+        typeof responseData === 'string'
+          ? responseData
+          : responseData?.message || responseData?.error || error.message;
+
+      this.log(`❌ Session request failed (${status}): ${message}`);
+
+      // Retry on server errors (5xx) and some client errors
+      if (status && status >= 500) return true; // Server errors
+      if (status === 429) return true; // Rate limit
+      if (status === 408) return true; // Request timeout
+      if (!status) return true; // Network errors
+
+      // Don't retry on authentication errors or bad requests
+      if (status === 401 || status === 403 || status === 400) return false;
+    } else {
+      this.log(`❌ Session request failed: ${error}`);
+    }
+
+    // Retry on network errors
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error.code === 'ECONNREFUSED' ||
+        error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT')
+    ) {
+      return true;
+    }
+
+    return false; // Don't retry by default
+  }
+
+  /**
+   * Connect to the gateway and authenticate
+   * @param feedHints Optional feeds for oracle selection (oracle mode only)
+   */
+  async connect(feedHints?: FeedSubscription[]): Promise<void> {
+    // Clean up existing websocket if it exists
+    if (this.ws) {
+      this.log('🔌 Closing existing websocket before creating new connection');
+      try {
+        this.ws.close(1000, 'Reconnecting');
+      } catch (e) {
+        this.log(`⚠️ Error closing existing websocket: ${e}`);
+      }
+      this.ws = null;
+    }
+
+    if (
+      this.connectionState === 'connected' ||
+      this.connectionState === 'connecting'
+    ) {
+      return;
+    }
+
+    try {
+      this.connectionState = 'connecting';
+
+      // Step 1: Request session token from gateway
+      const session = await this.requestSession(feedHints);
+      this.sessionData = session; // Store session data for later use
+
+      // Step 2: Connect to the returned WebSocket URL with auth header
+      this.log(`🔗 Attempting to connect to: ${session.ws_url}`);
+
+      // Try header-based auth for oracle mode, URL-based for crossbar mode
+      const authToken = `Bearer ${this.config.apiKey}:${session.session_token}`;
+
+      if (this.config.crossbarMode) {
+        // Crossbar mode: Use URL parameters (working)
+        this.log(`📡 Original WebSocket URL from session: ${session.ws_url}`);
+
+        // Create a new variable instead of modifying the original
+        let wsUrl = session.ws_url;
+        if (!wsUrl.includes('localhost') && !wsUrl.includes('127.0.0.1')) {
+          wsUrl = wsUrl.replace('ws://', 'wss://');
+          this.log(`🔒 Upgraded to secure WebSocket: ${wsUrl}`);
+        }
+        const url = new URL(wsUrl);
+        url.searchParams.set('authorization', authToken);
+
+        // Use the same IP that was used for session creation
+        if (this.sessionClientIp) {
+          url.searchParams.set('client_ip', this.sessionClientIp);
+          this.log(
+            `🔗 Using session IP for WebSocket: ${this.sessionClientIp}`
+          );
+        } else {
+          this.log(
+            '🔗 No session IP available, letting crossbar detect IP from headers'
+          );
+        }
+
+        const finalUrl = url.toString();
+        this.log(
+          `🔗 Final WebSocket URL (crossbar): ${finalUrl.substring(0, finalUrl.indexOf('?'))}?authorization=[MASKED]`
+        );
+        this.ws = new WebSocket(finalUrl);
+      } else {
+        // Oracle mode: Use headers (might fix the connection issue)
+        this.log(
+          `🔗 Final WebSocket URL (oracle): ${session.ws_url} with header auth`
+        );
+        this.ws = new WebSocket(session.ws_url, {
+          headers: {
+            Authorization: authToken,
+          },
+        });
+      }
+
+      this.sessionToken = session.session_token;
+
+      // Set up authentication promise for later waiting (only in crossbar mode)
+      if (this.config.crossbarMode) {
+        this.authenticationPromise = new Promise(resolve => {
+          this.authenticationResolve = resolve;
+        });
+      }
+
+      this.setupWebSocketHandlers();
+
+      // Wait for connection and authentication
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          this.log(`⏰ WebSocket connection timeout to: ${session.ws_url}`);
+          reject(new Error(`Connection timeout to ${session.ws_url}`));
+        }, 10000);
+
+        const isBrowser = typeof window !== 'undefined';
+
+        if (isBrowser) {
+          // Browser WebSocket
+          const handleOpen = () => {
+            clearTimeout(timeout);
+            if (this.config.crossbarMode) {
+              // In crossbar mode, wait for explicit 'Authenticated' message
+              this.connectionState = 'connected';
+              this.reconnectAttempts = 0;
+
+              // Wait for authentication before resolving
+              if (!this.authenticationPromise) {
+                this.authenticationPromise = new Promise(resolve => {
+                  this.authenticationResolve = resolve;
+                });
+              }
+
+              this.authenticationPromise
+                .then(() => {
+                  this.log('✅ Authentication confirmed in connect()');
+                  resolve();
+                })
+                .catch(reject);
+            } else {
+              // In oracle mode, authentication is implicit when WebSocket opens
+              this.connectionState = 'authenticated';
+              this.reconnectAttempts = 0;
+              resolve();
+            }
+          };
+
+          const handleError = () => {
+            clearTimeout(timeout);
+            this.log('❌ Browser WebSocket connection failed');
+            reject(new Error('WebSocket connection failed'));
+          };
+
+          this.ws!.addEventListener('open', handleOpen, { once: true });
+          this.ws!.addEventListener('error', handleError, { once: true });
+        } else {
+          // Node.js ws
+          this.ws!.once('open', () => {
+            clearTimeout(timeout);
+            if (this.config.crossbarMode) {
+              // In crossbar mode, wait for explicit 'Authenticated' message
+              this.connectionState = 'connected';
+              this.reconnectAttempts = 0;
+
+              // Wait for authentication before resolving
+              if (!this.authenticationPromise) {
+                this.authenticationPromise = new Promise(resolve => {
+                  this.authenticationResolve = resolve;
+                });
+              }
+
+              this.authenticationPromise
+                .then(() => {
+                  this.log('✅ Authentication confirmed in connect()');
+                  resolve();
+                })
+                .catch(reject);
+            } else {
+              // In oracle mode, authentication is implicit when WebSocket opens
+              this.connectionState = 'authenticated';
+              this.reconnectAttempts = 0;
+              resolve();
+            }
+          });
+
+          this.ws!.once('error', error => {
+            clearTimeout(timeout);
+            this.log(`❌ Node.js WebSocket error: ${error.message || error}`);
+            reject(error);
+          });
+        }
+      });
+    } catch (error) {
+      this.connectionState = 'error';
+      throw error;
+    }
+  }
+
+  /**
+   * Set up WebSocket event handlers
+   */
+  private setupWebSocketHandlers(): void {
+    if (!this.ws) return;
+
+    const isBrowser = typeof window !== 'undefined';
+
+    if (isBrowser) {
+      // Browser WebSocket uses addEventListener
+      this.ws.addEventListener('message', async event => {
+        try {
+          let data: string;
+          if (typeof event.data === 'string') {
+            data = event.data;
+          } else if (event.data instanceof Blob) {
+            data = await event.data.text();
+          } else {
+            data = new TextDecoder().decode(event.data as ArrayBuffer);
+          }
+          const message = JSON.parse(data);
+          this.handleWebSocketMessage(message);
+        } catch {
+          this.emit('error', {
+            type: 'processing',
+            message: 'Failed to parse WebSocket message',
+            retryable: false,
+          } as StreamingError);
+        }
+      });
+
+      this.ws.addEventListener('close', () => {
+        const previousState = this.connectionState;
+        this.connectionState = 'disconnected';
+        this.sessionToken = null;
+
+        // Only schedule reconnection if we weren't already in error state
+        // (error state handles its own reconnection)
+        if (this.config.autoReconnect && previousState !== 'error') {
+          this.scheduleReconnection();
+        }
+      });
+
+      this.ws.addEventListener('error', event => {
+        this.connectionState = 'error';
+        this.log(`❌ WebSocket connection error: ${event}`);
+        this.emit('error', {
+          type: 'connection',
+          message: 'WebSocket connection error',
+          retryable: true,
+        } as StreamingError);
+      });
+    } else {
+      // Node.js ws uses .on()
+      this.ws.on('message', (data: Buffer) => {
+        try {
+          const message = JSON.parse(data.toString());
+
+          this.handleWebSocketMessage(message);
+        } catch {
+          this.emit('error', {
+            type: 'processing',
+            message: 'Failed to parse WebSocket message',
+            retryable: false,
+          } as StreamingError);
+        }
+      });
+
+      this.ws.on('ping', (data: Buffer) => {
+        if (this.config.verbose) {
+          this.log('📡 Received ping, responding with pong');
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (this.ws as any).pong(data);
+      });
+
+      this.ws.on('close', () => {
+        const previousState = this.connectionState;
+        this.connectionState = 'disconnected';
+        this.sessionToken = null;
+
+        // Only schedule reconnection if we weren't already in error state
+        // (error state handles its own reconnection)
+        if (this.config.autoReconnect && previousState !== 'error') {
+          this.scheduleReconnection();
+        }
+      });
+
+      this.ws.on('error', error => {
+        this.connectionState = 'error';
+        this.log(`❌ WebSocket connection error: ${error.message}`);
+        this.emit('error', {
+          type: 'connection',
+          message: error.message,
+          retryable: true,
+        } as StreamingError);
+      });
+    }
+  }
+
+  /**
+   * Handle incoming WebSocket messages
+   */
+  private handleWebSocketMessage(message: WebSocketMessage): void {
+    // Handle different message types based on bundle_verbose_test.ts pattern
+    switch (message.type) {
+      case 'Authenticated':
+        this.log(`🔓 ${message.message || 'Authenticated'}`);
+        this.connectionState = 'authenticated';
+        if (this.authenticationResolve) {
+          this.authenticationResolve();
+          this.authenticationResolve = null;
+          this.authenticationPromise = null;
+        }
+        break;
+
+      case 'Subscribed':
+        {
+          const subscribedMsg = message as SubscribedMessage;
+          const bundleCount = subscribedMsg.feed_bundles?.length || 0;
+
+          // Track bundle IDs for oracle mode unsubscribe
+          if (subscribedMsg.feed_bundles && !this.config.crossbarMode) {
+            for (const bundle of subscribedMsg.feed_bundles) {
+              if (bundle.feed_bundle_id) {
+                // Store the feeds associated with this bundle ID
+                const feeds: FeedSubscription[] = bundle.feeds.map(f => {
+                  // Convert Pair object to string format
+                  const symbolStr =
+                    typeof f.symbol === 'string'
+                      ? f.symbol
+                      : `${(f.symbol as { base: string; quote: string }).base}/${(f.symbol as { base: string; quote: string }).quote}`;
+                  return {
+                    symbol: symbolStr,
+                    source: Source.fromString(f.source),
+                  };
+                });
+                this.bundleIdToFeeds.set(bundle.feed_bundle_id, feeds);
+
+                // Map each feed to its bundle ID
+                for (const feed of bundle.feeds) {
+                  // Convert Pair object to string format for key
+                  const symbolStr =
+                    typeof feed.symbol === 'string'
+                      ? feed.symbol
+                      : `${(feed.symbol as { base: string; quote: string }).base}/${(feed.symbol as { base: string; quote: string }).quote}`;
+                  const key = `${feed.source}:${symbolStr}`;
+                  this.feedToBundleId.set(key, bundle.feed_bundle_id);
+                }
+              }
+            }
+          }
+
+          this.log(`✅ Successfully subscribed to ${bundleCount} bundles`);
+        }
+        break;
+
+      case 'Unsubscribed':
+        {
+          const unsubscribedMsg = message as unknown as {
+            type: 'Unsubscribed';
+            feed_bundle_ids: string[];
+          };
+          const bundleCount = unsubscribedMsg.feed_bundle_ids?.length || 0;
+          this.log(`✅ Successfully unsubscribed from ${bundleCount} bundles`);
+        }
+        break;
+
+      case 'Error':
+        {
+          const errorMsg = message as { type: 'Error'; message: string };
+          this.log(`❌ Server error: ${errorMsg.message}`);
+          this.emit('error', {
+            type: 'validation',
+            message: errorMsg.message,
+            retryable: false,
+          } as StreamingError);
+        }
+        break;
+
+      case 'ValidationError':
+        {
+          const validationError = message as ValidationErrorMessage;
+          let errorMessage =
+            validationError.message ||
+            validationError.error ||
+            'Unknown validation error';
+
+          // Extract error from invalid_feeds if present
+          if (
+            validationError.invalid_feeds &&
+            validationError.invalid_feeds.length > 0
+          ) {
+            const invalidFeed = validationError.invalid_feeds[0];
+            errorMessage = `Feed validation failed for ${invalidFeed.symbol.base}/${invalidFeed.symbol.quote} (${invalidFeed.source}): ${invalidFeed.error}`;
+
+            // Log all invalid feeds
+            this.log('❌ Invalid feeds:');
+            validationError.invalid_feeds.forEach(feed => {
+              this.log(
+                `   - ${feed.symbol.base}/${feed.symbol.quote} (${feed.source}): ${feed.error}`
+              );
+            });
+          }
+
+          this.log(`❌ Validation error: ${errorMessage}`);
+          if (validationError.details) {
+            this.log(`❌ Details: ${JSON.stringify(validationError.details)}`);
+          }
+
+          this.emit('error', {
+            type: 'validation',
+            message: errorMessage,
+            retryable: false,
+          } as StreamingError);
+        }
+        break;
+
+      case 'BundledFeedUpdate':
+        try {
+          // Wrap the raw message in our response class
+          const oracleResponse = new SurgeUpdate(message as RawGatewayResponse);
+          this.emit('signedPriceUpdate', oracleResponse);
+        } catch (error) {
+          this.emit('error', {
+            type: 'processing',
+            message: `Failed to process BundledFeedUpdate: ${error}`,
+            retryable: false,
+          } as StreamingError);
+        }
+        break;
+      case 'UnsignedPriceUpdate':
+        try {
+          // Wrap the raw message in our UnsignedPriceUpdate class
+          const unsignedUpdate = new UnsignedPriceUpdate(
+            message as RawUnsignedPriceUpdate
+          );
+          this.emit('unsignedPriceUpdate', unsignedUpdate);
+        } catch (error) {
+          this.emit('error', {
+            type: 'processing',
+            message: `Failed to process UnsignedPriceUpdate: ${error}`,
+            retryable: false,
+          } as StreamingError);
+        }
+        break;
+
+      default:
+        // Handle legacy format for backward compatibility
+        if (
+          message.type === 'price_update' ||
+          message.type === 'update' ||
+          ('data' in message && message.data)
+        ) {
+          try {
+            const oracleResponse = new SurgeUpdate(
+              message as RawGatewayResponse
+            );
+            this.emit('signedPriceUpdate', oracleResponse);
+          } catch (_error) {
+            this.emit('error', {
+              type: 'processing',
+              message: `Failed to process update: ${_error}`,
+              retryable: false,
+            } as StreamingError);
+          }
+        } else {
+          // Check for potential error messages with different format
+          if ('message' in message && typeof message.message === 'string') {
+            this.log(`❌ Unknown message type with error: ${message.message}`);
+            this.emit('error', {
+              type: 'validation',
+              message: message.message,
+              retryable: false,
+            } as StreamingError);
+          } else {
+            this.log(`⚠️ Unknown message type: ${message.type}`);
+          }
+        }
+        break;
+    }
+  }
+
+  /**
+   * Subscribe to feeds
+   */
+  async subscribe(
+    feeds: FeedSubscription[],
+    batchIntervalMs?: number
+  ): Promise<void> {
+    // Validate feeds FIRST - before any connection attempts
+    // This will throw an error if any feed is invalid
+    await this.validateFeeds(feeds);
+
+    // Only connect after validation passes
+    if (this.connectionState !== 'authenticated') {
+      await this.connect();
+    }
+
+    // Wait for authentication message to be processed (only in crossbar mode)
+    if (this.config.crossbarMode && this.connectionState !== 'authenticated') {
+      this.log('🔍 Waiting for authentication confirmation...');
+
+      // Create authentication promise if it doesn't exist
+      if (!this.authenticationPromise) {
+        this.authenticationPromise = new Promise(resolve => {
+          this.authenticationResolve = resolve;
+        });
+      }
+
+      // Wait for authentication to complete with timeout
+      const authTimeout = new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error('Authentication timeout after 10 seconds')),
+          10000
+        );
+      });
+
+      try {
+        await Promise.race([this.authenticationPromise, authTimeout]);
+        this.log('🔍 Authentication confirmed, proceeding with subscription');
+      } catch (error) {
+        this.log(`❌ Authentication failed: ${error}`);
+        throw error;
+      }
+    } else {
+      this.log('🔍 Already authenticated, proceeding immediately');
+    }
+
+    // Process feed subscriptions (after validation)
+    const processedFeeds: ProcessedFeedData[] = [];
+
+    for (const feed of feeds) {
+      if ('feedHash' in feed) {
+        // For feedHash subscriptions, we need to reverse-lookup the symbol/source
+        const feedData = await this.resolveFeedHash(feed.feedHash);
+        processedFeeds.push(feedData);
+      } else {
+        processedFeeds.push({
+          symbol: feed.symbol,
+          source: feed.source || Source.WEIGHTED, // Default to weighted average
+        });
+      }
+    }
+
+    // Validate batch interval if provided
+    if (batchIntervalMs !== undefined) {
+      if (batchIntervalMs < 10 || batchIntervalMs > 5000) {
+        throw new Error(
+          'batchIntervalMs must be between 10 and 5000 milliseconds'
+        );
+      }
+    }
+    // if batch interval not procided the default is 50ms, implemente below
+    if (batchIntervalMs === undefined) {
+      batchIntervalMs = 50; // Default to 50ms if not specified
+    }
+    // Update local subscriptions map
+    for (const feed of processedFeeds) {
+      const source = Source.toString(feed.source);
+      const key = `${source}:${feed.symbol}`;
+      this.subscriptions.set(key, {
+        ...feed,
+        batchIntervalMs, // Store the batchIntervalMs
+      });
+    }
+
+    // Send subscription message (following bundle_verbose_test.ts format)
+    const subscriptionMessage: {
+      type: 'Subscribe';
+      feed_bundles: Array<{
+        feeds: Array<{
+          symbol: Pair;
+          source: string;
+        }>;
+      }>;
+      batch_interval_ms?: number;
+      signature_scheme?: 'Secp256k1' | 'Ed25519'; // Add signature scheme
+    } = {
+      type: 'Subscribe',
+      feed_bundles: [
+        {
+          feeds: processedFeeds.map(feed => ({
+            symbol: stringToPair(feed.symbol), // Convert string to Pair object
+            source: Source.toString(feed.source || Source.WEIGHTED), // Convert to string
+          })),
+        },
+      ],
+      // Default to Ed25519 if not specified in config
+      signature_scheme:
+        this.config.signatureScheme === 'secp256k1' ? 'Secp256k1' : 'Ed25519',
+    };
+
+    // Add batch_interval_ms if provided
+    if (batchIntervalMs !== undefined) {
+      subscriptionMessage.batch_interval_ms = batchIntervalMs;
+    }
+
+    // Wait for WebSocket to be ready before sending subscription
+    await this.waitForWebSocketReady();
+
+    if (this.ws && this.ws.readyState === 1) {
+      // 1 = OPEN
+      this.ws.send(JSON.stringify(subscriptionMessage));
+      this.log(`📡 Subscribed to ${processedFeeds.length} feeds`);
+    } else {
+      this.log(
+        `❌ Cannot send subscription - ws: ${!!this.ws}, readyState: ${this.ws?.readyState}`
+      );
+      throw new Error('WebSocket not ready for subscription');
+    }
+  }
+
+  /**
+   * Wait for WebSocket to be in OPEN state before sending messages
+   * @param timeoutMs Maximum time to wait in milliseconds
+   */
+  private async waitForWebSocketReady(timeoutMs: number = 5000): Promise<void> {
+    if (!this.ws) {
+      throw new Error('WebSocket not initialized');
+    }
+
+    if (this.ws.readyState === 1) {
+      // Already OPEN
+      return;
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(
+          new Error(
+            `WebSocket not ready within ${timeoutMs}ms. State: ${this.ws?.readyState}`
+          )
+        );
+      }, timeoutMs);
+
+      const checkReady = () => {
+        if (this.ws && this.ws.readyState === 1) {
+          clearTimeout(timeout);
+          resolve();
+        } else if (
+          this.ws &&
+          (this.ws.readyState === 2 || this.ws.readyState === 3)
+        ) {
+          // CLOSING or CLOSED
+          clearTimeout(timeout);
+          reject(
+            new Error(
+              `WebSocket is closing/closed. State: ${this.ws.readyState}`
+            )
+          );
+        } else {
+          // Still CONNECTING (0), check again in 50ms
+          setTimeout(checkReady, 50);
+        }
+      };
+
+      checkReady();
+    });
+  }
+
+  /**
+   * Validate that feeds exist and sources are available before attempting to subscribe
+   * @param feeds Array of feed subscriptions to validate
+   * @param retryCount Internal retry counter (defaults to 0)
+   * @throws Error if any feed is invalid with descriptive message after retries
+   */
+  async validateFeeds(
+    feeds: FeedSubscription[],
+    retryCount: number = 0
+  ): Promise<void> {
+    try {
+      const surgeFeedsData = await this.getSurgeFeeds();
+
+      this.log(
+        `🔍 Validating feeds against ${surgeFeedsData.data.length} available symbols`
+      );
+
+      for (const feed of feeds) {
+        if ('symbol' in feed) {
+          // Parse the symbol (e.g., "USDT/USD" -> base: "USDT", quote: "USD")
+          const parts = feed.symbol.toUpperCase().split('/');
+          if (parts.length !== 2) {
+            throw new Error(
+              `Invalid symbol format: ${feed.symbol}. Expected format: BASE/QUOTE`
+            );
+          }
+
+          const [base, quote] = parts;
+
+          // Find matching symbol in the data
+          const symbolData = surgeFeedsData.data.find(
+            item => item.symbol.base === base && item.symbol.quote === quote
+          );
+
+          if (!symbolData) {
+            throw new Error(
+              `Symbol ${feed.symbol} not found in available feeds`
+            );
+          }
+
+          // If source is specified, check it exists
+          if (feed.source) {
+            const source = Source.toString(feed.source);
+            const sourceExists = symbolData.feeds.some(
+              f => f.source === source
+            );
+
+            if (!sourceExists) {
+              const availableSources = symbolData.feeds.map(f => f.source);
+              throw new Error(
+                `Source '${source}' not available for ${feed.symbol}. Available sources: ${availableSources.join(', ')}`
+              );
+            }
+          }
+
+          this.log(
+            `✅ Validated: ${feed.symbol} ${feed.source ? `(${Source.toString(feed.source)})` : ''}`
+          );
+        }
+      }
+    } catch (error) {
+      // Retry logic for validation failures (simulator might be starting up)
+      const maxRetries = 3;
+      const retryDelayMs = 5000; // 5 seconds
+
+      const shouldRetry =
+        retryCount < maxRetries &&
+        error instanceof Error &&
+        (error.message.includes('Unknown symbol') ||
+          error.message.includes('Failed to fetch surge feeds') ||
+          error.message.includes('ECONNREFUSED') ||
+          error.message.includes('Network Error'));
+
+      if (shouldRetry) {
+        this.log(
+          `⚠️ Validation failed (attempt ${retryCount + 1}/${maxRetries + 1}): ${error.message}`
+        );
+        this.log(`⏳ Retrying validation in ${retryDelayMs}ms...`);
+
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        return this.validateFeeds(feeds, retryCount + 1);
+      }
+
+      // If we've exhausted retries or it's a different error, throw it
+      throw error;
+    }
+  }
+  /**
+   * Connect to gateway and subscribe to feeds in one operation with proper error handling
+   * This is the recommended method for most use cases as it validates feeds before any connection attempts
+   * @param feeds Array of feed subscriptions
+   * @throws Error if validation fails, connection fails, or subscription fails
+   */
+  async connectAndSubscribe(
+    feeds: FeedSubscription[],
+    batchIntervalMs?: number
+  ): Promise<void> {
+    try {
+      // Step 1: Validate feeds first (before any expensive operations)
+      await this.validateFeeds(feeds);
+
+      // Step 2: Connect if not already connected (pass feeds for oracle selection)
+      if (this.connectionState !== 'authenticated') {
+        await this.connect(feeds);
+      }
+
+      // Wait for authentication message to be processed (only in crossbar mode)
+      if (
+        this.config.crossbarMode &&
+        this.connectionState !== 'authenticated'
+      ) {
+        this.log('🔍 Waiting for authentication confirmation...');
+
+        // Create authentication promise if it doesn't exist
+        if (!this.authenticationPromise) {
+          this.authenticationPromise = new Promise(resolve => {
+            this.authenticationResolve = resolve;
+          });
+        }
+
+        // Wait for authentication to complete with timeout
+        const authTimeout = new Promise((_, reject) => {
+          setTimeout(
+            () => reject(new Error('Authentication timeout after 10 seconds')),
+            10000
+          );
+        });
+
+        try {
+          await Promise.race([this.authenticationPromise, authTimeout]);
+          this.log('🔍 Authentication confirmed, proceeding with subscription');
+        } catch (error) {
+          this.log(`❌ Authentication failed: ${error}`);
+          throw error;
+        }
+      } else {
+        this.log('🔍 Already authenticated, proceeding immediately');
+      }
+
+      // Step 3: Subscribe to the validated feeds (without re-validation)
+      await this.subscribeWithoutValidation(feeds, batchIntervalMs);
+    } catch (error) {
+      // Clean up connection on any failure
+      if (
+        this.connectionState === 'connecting' ||
+        this.connectionState === 'connected'
+      ) {
+        this.disconnect();
+      }
+
+      // Re-throw with context
+      throw new Error(
+        `Failed to connect and subscribe: ${error instanceof Error ? error.message : error}`
+      );
+    }
+  }
+  /**
+   * Subscribe to all available feeds with optional source filtering
+   */
+  async subscribeToAll(
+    sources_?: Source[],
+    batchIntervalMs?: number
+  ): Promise<void> {
+    if ((sources_ ?? []).length === 0) {
+      sources_ = [Source.WEIGHTED];
+    }
+    const sources = sources_?.map(s => Source.toString(s));
+
+    // Validate batchIntervalMs if provided
+    if (batchIntervalMs !== undefined) {
+      if (batchIntervalMs < 10 || batchIntervalMs > 5000) {
+        throw new Error(
+          'batchIntervalMs must be between 10 and 5000 milliseconds'
+        );
+      }
+    }
+
+    this.log(
+      `🔍 subscribeToAll called - connectionState: ${this.connectionState}, batchIntervalMs: ${batchIntervalMs}`
+    );
+    if (this.connectionState !== 'authenticated') {
+      this.log('🔗 Connection not authenticated, connecting...');
+      await this.connect();
+    }
+
+    this.log(
+      `🔍 After connect - connectionState: ${this.connectionState}, ws.readyState: ${this.ws?.readyState}`
+    );
+
+    // Wait for authentication message to be processed (only in crossbar mode)
+    if (this.config.crossbarMode && this.connectionState !== 'authenticated') {
+      this.log('🔍 Waiting for authentication confirmation...');
+
+      // Create authentication promise if it doesn't exist
+      if (!this.authenticationPromise) {
+        this.authenticationPromise = new Promise(resolve => {
+          this.authenticationResolve = resolve;
+        });
+      }
+
+      // Wait for authentication to complete with timeout
+      const authTimeout = new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error('Authentication timeout after 10 seconds')),
+          10000
+        );
+      });
+
+      try {
+        await Promise.race([this.authenticationPromise, authTimeout]);
+        this.log('🔍 Authentication confirmed, proceeding with subscription');
+      } catch (error) {
+        this.log(`❌ Authentication failed: ${error}`);
+        throw error;
+      }
+    } else {
+      this.log('🔍 Already authenticated, proceeding immediately');
+    }
+
+    const subscribeAllMessage = {
+      type: 'SubscribeAll',
+      sources: sources || undefined, // Only include if provided
+      batch_interval_ms: batchIntervalMs || undefined, // Only include if provided
+    };
+
+    this.log(
+      `🔍 About to send subscription - ws: ${!!this.ws}, readyState: ${this.ws?.readyState}`
+    );
+
+    // Wait for WebSocket to be ready before sending subscription
+    await this.waitForWebSocketReady();
+
+    if (this.ws && this.ws.readyState === 1) {
+      // 1 = OPEN
+      this.log(
+        `📤 Sending subscription message: ${JSON.stringify(subscribeAllMessage)}`
+      );
+      this.ws.send(JSON.stringify(subscribeAllMessage));
+      if (sources) {
+        this.log(`📡 Subscribed to prices from sources: ${sources.join(', ')}`);
+      } else {
+        this.log('📡 Subscribed to ALL available prices');
+      }
+    } else {
+      this.log(
+        `❌ Cannot send subscription - ws: ${!!this.ws}, readyState: ${this.ws?.readyState}`
+      );
+      throw new Error('WebSocket not ready for subscription');
+    }
+  }
+
+  /**
+   * Internal subscribe method that skips validation (assumes feeds are already validated)
+   */
+  private async subscribeWithoutValidation(
+    feeds: FeedSubscription[],
+    batchIntervalMs?: number
+  ): Promise<void> {
+    // Process feed subscriptions (assuming validation already passed)
+    const processedFeeds: ProcessedFeedData[] = [];
+
+    for (const feed of feeds) {
+      if ('feedHash' in feed) {
+        // For feedHash subscriptions, we need to reverse-lookup the symbol/source
+        const feedData = await this.resolveFeedHash(feed.feedHash);
+        processedFeeds.push(feedData);
+      } else {
+        processedFeeds.push({
+          symbol: feed.symbol,
+          source: feed.source || Source.WEIGHTED, // Default to weighted average
+        });
+      }
+    }
+
+    // Update local subscriptions map
+    for (const feed of processedFeeds) {
+      const source = Source.toString(feed.source);
+      const key = `${source}:${feed.symbol}`;
+      this.subscriptions.set(key, feed);
+    }
+
+    // Send subscription message (following bundle_verbose_test.ts format)
+    const subscriptionMessage: {
+      type: 'Subscribe';
+      feed_bundles: Array<{
+        feeds: Array<{
+          symbol: Pair;
+          source: string;
+        }>;
+      }>;
+      batch_interval_ms?: number;
+      signature_scheme?: 'Secp256k1' | 'Ed25519'; // Add signature scheme
+    } = {
+      type: 'Subscribe',
+      feed_bundles: [
+        {
+          feeds: processedFeeds.map(feed => ({
+            symbol: stringToPair(feed.symbol), // Convert string to Pair object
+            source: Source.toString(feed.source), // Convert enum to string
+          })),
+        },
+      ],
+      // Default to Ed25519 if not specified in config
+      signature_scheme:
+        this.config.signatureScheme === 'secp256k1' ? 'Secp256k1' : 'Ed25519',
+    };
+
+    // Add batch_interval_ms if provided
+    if (batchIntervalMs !== undefined) {
+      subscriptionMessage.batch_interval_ms = batchIntervalMs;
+    }
+
+    if (this.ws && this.ws.readyState === 1) {
+      // 1 = OPEN
+      this.ws.send(JSON.stringify(subscriptionMessage));
+      this.log(`📡 Subscribed to ${processedFeeds.length} feeds`);
+    }
+  }
+  /**
+   * Resolve feedHash to symbol/source pair
+   */
+  private async resolveFeedHash(feedHash: string): Promise<ProcessedFeedData> {
+    // Get surge feeds data
+    const surgeFeedsData = await this.getSurgeFeeds();
+
+    // Search through all feeds to find matching hash
+    for (const symbolGroup of surgeFeedsData.data) {
+      for (const feed of symbolGroup.feeds) {
+        // Note: This is a simplified lookup - in production you'd want to
+        // generate the actual feed hash from the feed data and compare
+        if (feed.feed_id === feedHash) {
+          return {
+            feedHash,
+            symbol: pairToString(symbolGroup.symbol),
+            source: Source.fromString(feed.source),
+          };
+        }
+      }
+    }
+
+    throw new Error(`Feed hash ${feedHash} not found in available feeds`);
+  }
+
+  /**
+   * Get total number of feeds available
+   */
+  private async getTotalFeeds(endpoint: string): Promise<number> {
+    try {
+      const response = await axios.get(`${endpoint}?limit=1`);
+      return response.data.total || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Check if a specific feed exists
+   * @param symbol The symbol to check (e.g., "BTC/USD")
+   * @param source Optional source to check (e.g., Source.WEIGHTED)
+   * @returns true if the feed exists
+   */
+  async checkFeedExists(
+    symbol: string,
+    source?: Source | string
+  ): Promise<boolean> {
+    try {
+      const feedInfo = await this.getFeedInfo(symbol);
+
+      if (!feedInfo) {
+        return false;
+      }
+
+      // If no source specified, just check symbol exists
+      if (!source) {
+        return true;
+      }
+
+      // Check if specific source exists
+      const sourceStr =
+        typeof source === 'string' ? source : Source.toString(source);
+      return feedInfo.feeds.some(f => f.source === sourceStr);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get available feeds for a specific symbol
+   * @param symbol The symbol to query (e.g., "BTC/USD")
+   * @returns The feed data for this symbol, or null if not found
+   */
+  async getFeedInfo(symbol: string): Promise<SurgeSymbolGroup | null> {
+    try {
+      let endpoint: string;
+
+      if (this.config.crossbarMode) {
+        // Crossbar mode - use crossbar endpoint
+        const baseUrl = this.config.crossbarUrl || '';
+        endpoint = `${baseUrl}/stream/surge_feeds`;
+      } else {
+        // Normal mode - use the oracle that created our session
+        if (this.sessionData?.ws_url) {
+          // Convert ws:// or wss:// back to http:// or https://
+          let oracleUrl = this.sessionData.ws_url
+            .replace('ws://', 'http://')
+            .replace('wss://', 'https://')
+            .replace('/oracle/api/v1/surge_stream', ''); // Remove the WS path
+
+          // If gateway is localhost, use localhost:8081 for oracle
+          if (
+            this.config.gatewayUrl &&
+            (this.config.gatewayUrl.includes('localhost') ||
+              this.config.gatewayUrl.includes('127.0.0.1'))
+          ) {
+            oracleUrl = 'http://localhost:8081';
+          }
+
+          endpoint = `${oracleUrl}/oracle/api/v1/surge_feeds`;
+        } else {
+          // Fallback: if no session yet but gateway is localhost, use port 8081
+          const gatewayUrl =
+            this.config.gatewayUrl || this.gateway?.gatewayUrl || '';
+          if (
+            gatewayUrl.includes('localhost') ||
+            gatewayUrl.includes('127.0.0.1')
+          ) {
+            endpoint = 'http://localhost:8081/oracle/api/v1/surge_feeds';
+            this.log(
+              '🏠 Using localhost oracle (no session yet): http://localhost:8081'
+            );
+          } else {
+            endpoint = `${gatewayUrl}/oracle/api/v1/surge_feeds`;
+          }
+        }
+      }
+
+      const response = await axios.get(
+        `${endpoint}?symbol=${symbol.toUpperCase()}`
+      );
+      const data = response.data as SurgeFeedsResponse;
+
+      if (!data.data || data.data.length === 0) {
+        return null;
+      }
+
+      return data.data[0];
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Get available surge feeds (always fresh)
+   * NOTE: Due to API limitations, this may not return all available feeds.
+   * Use checkFeedExists() or getFeedInfo() to check specific feeds.
+   */
+  private async getSurgeFeeds(): Promise<SurgeFeedsResponse> {
+    try {
+      let endpoint: string;
+
+      if (this.config.crossbarMode) {
+        // Crossbar mode - use crossbar endpoint
+        const baseUrl = this.config.crossbarUrl || '';
+        endpoint = `${baseUrl}/stream/surge_feeds`;
+        this.log(`🔍 Fetching surge feeds from crossbar: ${endpoint}`);
+      } else {
+        // Normal mode - use the oracle that created our session
+        if (this.sessionData?.ws_url) {
+          // Convert ws:// or wss:// back to http:// or https://
+          let oracleUrl = this.sessionData.ws_url
+            .replace('ws://', 'http://')
+            .replace('wss://', 'https://')
+            .replace('/oracle/api/v1/surge_stream', ''); // Remove the WS path
+
+          // If gateway is localhost, use localhost:8081 for oracle
+          if (
+            this.config.gatewayUrl &&
+            (this.config.gatewayUrl.includes('localhost') ||
+              this.config.gatewayUrl.includes('127.0.0.1'))
+          ) {
+            oracleUrl = 'http://localhost:8081';
+            this.log('🏠 Using localhost oracle for surge feeds: ' + oracleUrl);
+          }
+
+          endpoint = `${oracleUrl}/oracle/api/v1/surge_feeds`; // Use session endpoint
+        } else {
+          // Fallback: if no session yet but gateway is localhost, use port 8081
+          const gatewayUrl =
+            this.config.gatewayUrl || this.gateway?.gatewayUrl || '';
+          if (
+            gatewayUrl.includes('localhost') ||
+            gatewayUrl.includes('127.0.0.1')
+          ) {
+            endpoint = 'http://localhost:8081/oracle/api/v1/surge_feeds';
+            this.log(
+              '🏠 Using localhost oracle (no session yet): http://localhost:8081'
+            );
+          } else {
+            endpoint = `${gatewayUrl}/oracle/api/v1/surge_feeds`;
+          }
+        }
+      }
+
+      // Fetch surge feeds
+      this.log(`🔍 Fetching surge feeds from: ${endpoint}`);
+
+      const response = await axios.get(endpoint, {
+        maxContentLength: 100 * 1024 * 1024, // 100MB
+        maxBodyLength: 100 * 1024 * 1024, // 100MB
+        timeout: 30000, // 30 seconds
+      });
+
+      const responseData = response.data as SurgeFeedsResponse;
+
+      // Count total feeds
+      const totalFeeds =
+        responseData.data?.reduce(
+          (count, symbol) => count + symbol.feeds.length,
+          0
+        ) || 0;
+
+      this.log(
+        `📋 Got all ${responseData.data?.length || 0} symbols with ${totalFeeds} feeds (total field shows ${responseData.total} feeds)`
+      );
+
+      return responseData;
+    } catch (error) {
+      throw new Error(`Failed to fetch surge feeds: ${error}`);
+    }
+  }
+
+  /**
+   * Unsubscribe from feeds
+   */
+  async unsubscribe(feeds: FeedSubscription[]): Promise<void> {
+    // Collect bundle IDs for oracle mode
+    const bundleIds = new Set<string>();
+
+    // Remove from local subscriptions
+    for (const feed of feeds) {
+      if ('feedHash' in feed) {
+        // Find and remove by feedHash
+        for (const [key, subFeed] of this.subscriptions.entries()) {
+          if (subFeed.feedHash === feed.feedHash) {
+            this.subscriptions.delete(key);
+            break;
+          }
+        }
+      } else {
+        const source = Source.toString(feed.source || Source.WEIGHTED);
+        const key = `${source}:${feed.symbol}`;
+        this.subscriptions.delete(key);
+
+        // In oracle mode, collect the bundle ID for this feed
+        if (!this.config.crossbarMode) {
+          const bundleId = this.feedToBundleId.get(key);
+          if (bundleId) {
+            bundleIds.add(bundleId);
+          }
+        }
+      }
+    }
+
+    // Create appropriate unsubscribe message based on mode
+    let unsubscribeMessage:
+      | {
+          type: string;
+          feed_bundle_ids?: string[];
+          feed_bundles?: Array<{
+            feeds: Array<{ symbol: Pair; source: string }>;
+          }>;
+        }
+      | undefined;
+
+    if (this.config.crossbarMode) {
+      // Crossbar mode: use feed_bundles
+      const symbolFeeds = feeds.filter(feed => !('feedHash' in feed));
+
+      if (symbolFeeds.length > 0) {
+        const feedBundles = [
+          {
+            feeds: symbolFeeds.map(feed => ({
+              symbol: stringToPair((feed as SymbolSubscription).symbol),
+              source: Source.toString(
+                (feed as SymbolSubscription).source || Source.WEIGHTED
+              ),
+            })),
+          },
+        ];
+
+        unsubscribeMessage = {
+          type: 'Unsubscribe',
+          feed_bundles: feedBundles,
+        };
+      }
+    } else {
+      // Oracle mode: use feed_bundle_ids
+      if (bundleIds.size > 0) {
+        unsubscribeMessage = {
+          type: 'Unsubscribe',
+          feed_bundle_ids: Array.from(bundleIds),
+        };
+      }
+    }
+
+    // Only send if we have something to unsubscribe
+    if (unsubscribeMessage && this.ws && this.ws.readyState === 1) {
+      this.ws.send(JSON.stringify(unsubscribeMessage));
+
+      // Clean up bundle ID tracking for oracle mode
+      if (!this.config.crossbarMode) {
+        for (const bundleId of bundleIds) {
+          this.bundleIdToFeeds.delete(bundleId);
+        }
+        for (const feed of feeds) {
+          if (!('feedHash' in feed)) {
+            const source = Source.toString(feed.source || Source.WEIGHTED);
+            const key = `${source}:${feed.symbol}`;
+            this.feedToBundleId.delete(key);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Disconnect from the gateway
+   */
+  disconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    // Disable auto-reconnect when explicitly disconnecting
+    const originalAutoReconnect = this.config.autoReconnect;
+    this.config.autoReconnect = false;
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this.connectionState = 'disconnected';
+    this.sessionToken = null;
+    this.sessionData = null;
+    this.subscriptions.clear();
+    this.bundleIdToFeeds.clear();
+    this.feedToBundleId.clear();
+
+    // Clear authentication promise to prevent hanging promises
+    this.authenticationPromise = null;
+    this.authenticationResolve = null;
+
+    // Restore auto-reconnect setting for future connections
+    this.config.autoReconnect = originalAutoReconnect;
+  }
+
+  /**
+   * Schedule automatic reconnection
+   */
+  private scheduleReconnection(): void {
+    const timestamp = Date.now();
+    const timeStr = new Date(timestamp).toISOString();
+
+    this.log(`🔄 [${timeStr}] scheduleReconnection()
+  called`);
+
+    // Check if already connected or connecting
+    if (
+      this.connectionState === 'authenticated' ||
+      this.connectionState === 'connected' ||
+      this.connectionState === 'connecting'
+    ) {
+      this.log(
+        `🔄 [${timeStr}] Already ${this.connectionState}, skipping reconnection`
+      );
+      return;
+    }
+
+    if (this.reconnectAttempts >= (this.config.maxReconnectAttempts || 5)) {
+      this.emit('error', {
+        type: 'connection',
+        message: 'Maximum reconnection attempts exceeded',
+        retryable: false,
+      } as StreamingError);
+      return;
+    }
+    // Prevent multiple simultaneous reconnection attempts
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.log(
+        `🔄 [${timeStr}] Clearing existing reconnection timer to prevent duplicate attempts`
+      );
+      return;
+    }
+
+    // Calculate delay: first attempt at 300ms, then exponential backoff
+    const baseDelay = this.config.reconnectDelay || 1000;
+    let delay: number;
+
+    if (this.reconnectAttempts === 0) {
+      // First reconnection attempt - try quickly at 300ms
+      delay = 300;
+    } else {
+      // Subsequent attempts - exponential backoff starting from base delay
+      const exponentialDelay =
+        baseDelay * Math.pow(2, this.reconnectAttempts - 1);
+      delay = Math.min(exponentialDelay, 60000); // Max 60s
+    }
+
+    this.reconnectAttempts++;
+    this.log(`🔄 [${timeStr}] Scheduling reconnection
+  attempt #${this.reconnectAttempts} with ${delay}ms
+  delay`);
+    this.reconnectTimer = setTimeout(async () => {
+      const reconnectStartTime = Date.now();
+      const reconnectTimeStr = new Date(reconnectStartTime).toISOString();
+      this.log(`🔄 [${reconnectTimeStr}] Starting actual
+  reconnection attempt #${this.reconnectAttempts}`);
+
+      // Final check before reconnecting
+      if (
+        this.connectionState === 'authenticated' ||
+        this.connectionState === 'connected'
+      ) {
+        this.log(
+          `🔄 [${reconnectTimeStr}] Already ${this.connectionState} when timer fired, aborting reconnection`
+        );
+        this.reconnectTimer = null;
+        return;
+      }
+
+      try {
+        // Defensive cleanup: ensure any existing connection is closed
+        if (this.ws) {
+          this.log(
+            `🔌 [${reconnectTimeStr}] Closing existing websocket before reconnection`
+          );
+          try {
+            this.ws.close(1000, 'Reconnecting');
+          } catch (e) {
+            this.log(
+              `⚠️ [${reconnectTimeStr}] Error closing existing websocket: ${e}`
+            );
+          }
+          this.ws = null;
+        }
+
+        // Clear old session token and authentication state to force fresh session
+        this.sessionToken = null;
+        this.authenticationPromise = null;
+        this.authenticationResolve = null;
+
+        this.log(`🔄 [${reconnectTimeStr}] Reconnecting
+  with fresh session token...`);
+        // ... rest of reconnection logic
+        await this.connect();
+        // Extract batchIntervalMs from the first subscription (they should all be the same)
+        const firstFeed = Array.from(this.subscriptions.values())[0];
+        const batchIntervalMs = firstFeed.batchIntervalMs;
+        // Re-subscribe to existing feeds
+        if (this.subscriptions.size > 0) {
+          const feeds = Array.from(this.subscriptions.values()).map(feed =>
+            feed.feedHash
+              ? { feedHash: feed.feedHash }
+              : { symbol: feed.symbol, source: feed.source }
+          );
+
+          this.log(
+            `🔍 [${reconnectTimeStr}] Validating ${feeds.length} feeds before re-subscription...`
+          );
+          try {
+            // Validate feeds are still available before re-subscribing
+            await this.validateFeeds(feeds);
+            this.log(
+              `✅ [${reconnectTimeStr}] All feeds validated, proceeding with subscription`
+            );
+            await this.subscribe(feeds, batchIntervalMs);
+          } catch (validationError) {
+            this.log(
+              `❌ [${reconnectTimeStr}] Feed validation failed during reconnection: ${validationError}`
+            );
+            // Continue with valid feeds only, or emit error if all feeds are invalid
+            this.emit('error', {
+              type: 'subscription',
+              message: `Feed validation failed during reconnection: ${validationError}`,
+              retryable: true,
+            } as StreamingError);
+            // Still try to reconnect without feeds for now
+          }
+        }
+        // Clear reconnect timer on successful reconnection
+        this.reconnectTimer = null;
+      } catch {
+        // Clear timer before scheduling new reconnection
+        this.reconnectTimer = null;
+        this.scheduleReconnection();
+      }
+    }, delay);
+  }
+
+  /**
+   * Get current connection state
+   */
+  getConnectionState(): ConnectionState {
+    return this.connectionState;
+  }
+
+  /**
+   * Get list of active subscriptions
+   */
+  getSubscriptions(): FeedSubscription[] {
+    return Array.from(this.subscriptions.values()).map(feed =>
+      feed.feedHash
+        ? { feedHash: feed.feedHash }
+        : { symbol: feed.symbol, source: feed.source }
+    );
+  }
+
+  /**
+   * Check if a specific feed is subscribed
+   */
+  isSubscribed(feed: FeedSubscription): boolean {
+    if ('feedHash' in feed) {
+      return Array.from(this.subscriptions.values()).some(
+        f => f.feedHash === feed.feedHash
+      );
+    } else {
+      const source = Source.toString(feed.source);
+      const key = `${source}:${feed.symbol}`;
+      return this.subscriptions.has(key);
+    }
+  }
+}
